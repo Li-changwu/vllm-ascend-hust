@@ -29,8 +29,15 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod, get_compressed_expert_map
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
-from vllm.model_executor.layers.fused_moe.runner.default_moe_runner import DefaultMoERunner  # type: ignore
-from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # type: ignore
+try:
+    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+except ModuleNotFoundError:
+    class SharedFusedMoE:
+        """Compatibility mixin for vLLM versions where shared experts moved
+        into FusedMoE/MoERunner instead of a separate SharedFusedMoE class."""
+
+        pass
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -41,6 +48,7 @@ from vllm_ascend.flash_common3_context import get_flash_common3_context, set_fla
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -75,6 +83,26 @@ def mock_true():
     return True
 
 
+def _fixed_slot_device_for_processed_weight(weight: torch.Tensor) -> torch.device:
+    if weight.device.type == "cpu":
+        return torch.device("npu", torch.npu.current_device())
+    return weight.device
+
+
+def _build_fixed_slot_profile_topk_ids(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_slots: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if top_k > num_slots:
+        raise RuntimeError(f"fixed-slot profile run requires num_slots >= top_k, got {num_slots} < {top_k}")
+    base_ids = torch.arange(top_k, device=device, dtype=dtype)
+    return base_ids.unsqueeze(0).expand(num_tokens, top_k).contiguous()
+
+
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig = None):
         super().__init__(moe=moe)
@@ -105,6 +133,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         else:
             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
             layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+        moe_offload_runtime = get_moe_offload_runtime()
+        layer_id = int(getattr(layer, "layer_id", -1))
+        if moe_offload_runtime.should_use_fixed_slot_plan_for_layer(layer_id):
+            moe_offload_runtime.register_layer_for_fixed_slots(
+                layer,
+                slot_device=_fixed_slot_device_for_processed_weight(layer.w13_weight),
+            )
+            if moe_offload_runtime.config.release_original_expert_weights:
+                moe_offload_runtime.release_original_expert_weights_if_ready(layer)
 
     def apply(
         self,
@@ -155,6 +192,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_logical_experts,
         )
+        moe_offload_runtime = get_moe_offload_runtime()
+        topk_ids, topk_weights = moe_offload_runtime.trace_routing(
+            layer_id=getattr(layer, "layer_id", -1),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            num_experts=num_logical_experts,
+        )
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -162,6 +206,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     layer_id=layer.layer_id,
                     topk_ids=topk_ids,
                 )
+
+        if moe_offload_runtime.should_use_fixed_slots and zero_expert_num > 0 and zero_expert_type is not None:
+            raise NotImplementedError("MoE offload fixed slots do not support zero expert path yet")
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -176,7 +223,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        if enable_force_load_balance:
+        if enable_force_load_balance and moe_offload_runtime.should_use_fixed_slots:
+            topk_ids = _build_fixed_slot_profile_topk_ids(
+                num_tokens=topk_ids.size(0),
+                top_k=topk_ids.size(1),
+                num_slots=moe_offload_runtime.config.num_slots,
+                device=topk_ids.device,
+                dtype=topk_ids.dtype,
+            )
+        elif enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
@@ -201,6 +256,29 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w1_scale = None
             w2 = layer.w2_weight
             w2_scale = None
+        physical_expert_count = None
+        offload_enabled = False
+        offload_expected_device_type = x.device.type
+
+        layer_id = int(getattr(layer, "layer_id", -1))
+        if moe_offload_runtime.should_use_fixed_slot_plan_for_layer(layer_id):
+            if _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER:
+                raise NotImplementedError("MoE offload fixed slots currently support AllGather only")
+            if expert_map is not None:
+                raise NotImplementedError("MoE offload fixed slots do not support expert_map yet")
+            if global_redundant_expert_num != 0:
+                raise NotImplementedError("MoE offload fixed slots do not support redundant experts yet")
+            if self.moe.has_bias:
+                raise NotImplementedError("MoE offload fixed slots do not support expert bias yet")
+
+            if not moe_offload_runtime.is_layer_registered(layer_id):
+                moe_offload_runtime.register_layer_for_fixed_slots(
+                    layer,
+                    slot_device=_fixed_slot_device_for_processed_weight(layer.w13_weight),
+                )
+                if moe_offload_runtime.config.release_original_expert_weights:
+                    moe_offload_runtime.release_original_expert_weights_if_ready(layer)
+            offload_enabled = True
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -218,10 +296,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 mc2_mask=mc2_mask,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 log2phy=log2phy,
+                physical_expert_count=physical_expert_count,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
+                offload_enabled=offload_enabled,
+                offload_layer_id=layer_id,
+                offload_num_logical_experts=num_logical_experts,
+                offload_expected_device_type=offload_expected_device_type,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -229,13 +312,27 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return final_hidden_states
 
 
-# Please remove this inheritance after extending vllm, todo(wxs)
-class AscendMoERunner(DefaultMoERunner):
+class AscendMoERunner(MoERunner):
     @property
     def use_dp_chunking(self) -> bool:
         """Ascend uses its own forward_impl path, not the FlashInfer Cutlass
         chunked path. Always return False to stay on forward_impl."""
         return False
+
+    @property
+    def _fused_output_is_reduced(self) -> bool:
+        moe_comm_type = _EXTRA_CTX.moe_comm_type
+        return moe_comm_type in {
+            MoECommType.ALLTOALL,
+            MoECommType.MC2,
+            MoECommType.FUSED_MC2,
+        } or (moe_comm_type == MoECommType.ALLGATHER and _EXTRA_CTX.flash_comm_v1_enabled)
+
+    def _maybe_reduce_shared_expert_output(
+        self,
+        shared_output: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        return shared_output
 
     # TODO: Remove this after drop v0.19.1 support
     def forward_impl(
@@ -250,19 +347,26 @@ class AscendMoERunner(DefaultMoERunner):
         This delegates to the layer's forward_impl method which contains the
         Ascend-specific MoE computation logic.
         """
-        result = layer.forward_impl(hidden_states, router_logits)
+        if self.shared_experts is None:
+            result = layer.forward_impl(hidden_states, router_logits)
+        else:
+            result = layer.shared_forward_impl(hidden_states, router_logits)
         # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)
         # Otherwise, it returns just routed_out
         # The torch op expects the same return type based on whether it's moe_forward or moe_forward_shared
         return result
 
-    def forward_dispatch(
+    def _forward_impl(
         self,
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.gate is not None:
+            router_logits, _ = self.gate(hidden_states)
+
         with self._sequence_parallel_context():
             return self.forward_impl(
                 layer,
@@ -370,12 +474,15 @@ class AscendFusedMoE(FusedMoE):
             self.layer_name,
             self.moe_config,
             self.router,
-            self._routed_input_transform,
+            kwargs.get("routed_input_transform"),
             kwargs.pop("gate", None),
             kwargs.pop("shared_experts", None),
             self.quant_method,
-            self.reduce_results,
             self.vllm_config.parallel_config.enable_dbo,
+            routed_output_transform=kwargs.get("routed_output_transform"),
+            routed_scaling_factor=kwargs.get("routed_scaling_factor", 1.0)
+            if kwargs.get("apply_routed_scale_to_output", False)
+            else 1.0,
         )
 
     def _get_quant_type(self) -> QuantType:
@@ -539,7 +646,7 @@ class AscendFusedMoE(FusedMoE):
                 self.moe_load.add_(local_load)
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
-            reduce_results=self.reduce_results,
+            reduce_results=getattr(self, "reduce_results", False),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
 
@@ -599,8 +706,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             self.gate,
             self._shared_experts,
             self.quant_method,
-            self.reduce_results,
             self.vllm_config.parallel_config.enable_dbo,
+            routed_output_transform=getattr(self, "_routed_output_transform", None),
         )
 
         if self.multistream_overlap_shared_expert:
