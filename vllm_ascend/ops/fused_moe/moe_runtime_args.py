@@ -66,6 +66,7 @@ from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
     MoEFusedExpertsInput,
     MoEMC2CombineMetadata,
     MoEMlpComputeInput,
+    MoEOffloadParams,
     MoEPrepareOutput,
     MoETokenDispatchInput,
     MoETokenDispatchOutput,
@@ -127,6 +128,7 @@ def build_fused_experts_input(
     mc2_mask: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     log2phy: torch.Tensor | None = None,
+    physical_expert_count: int | None = None,
     pertoken_scale: torch.Tensor | None = None,
     activation: str = "silu",
     need_trans: bool = False,
@@ -144,6 +146,10 @@ def build_fused_experts_input(
     w2_scale_bias: torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    offload_enabled: bool = False,
+    offload_layer_id: int = -1,
+    offload_num_logical_experts: int = -1,
+    offload_expected_device_type: str = "npu",
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -167,11 +173,20 @@ def build_fused_experts_input(
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             log2phy=log2phy,
+            physical_expert_count=physical_expert_count,
             pertoken_scale=pertoken_scale,
         ),
         activation=activation,
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
+        offload=MoEOffloadParams(
+            enabled=offload_enabled,
+            layer_id=offload_layer_id,
+            num_logical_experts=offload_num_logical_experts,
+            expected_device_type=offload_expected_device_type,
+        )
+        if offload_enabled
+        else None,
         quant=MoEQuantParams(
             quant_type=quant_type,
             comm_quant_mode=comm_quant_mode,
@@ -231,6 +246,7 @@ __all__ = [
     "MoEFusedExpertsInput",
     "MoEMC2CombineMetadata",
     "MoEMlpComputeInput",
+    "MoEOffloadParams",
     "MoEPrepareOutput",
     "MoEQuantParams",
     "MoERoutingParams",
