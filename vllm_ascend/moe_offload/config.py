@@ -29,16 +29,9 @@ class MoeOffloadConfig:
     enabled: bool = False
     trace_only: bool = False
     num_slots: int = 0
-    policy: str = "deadline"
-    max_phases: int = 2
-    async_load: bool = False
     trace_max_records: int = 4096
-    # MVP-D.9: tiered residency (default off / empty)
     resident_layer_ids: frozenset[int] = frozenset()
     release_original_expert_weights: bool = False
-    # MVP-D.10: dynamic-count layered runtime path selector (default off).
-    layered_runtime: bool = False
-    fanout_threshold: int = 0
 
     @classmethod
     def from_env(cls) -> "MoeOffloadConfig":
@@ -46,16 +39,11 @@ class MoeOffloadConfig:
             enabled=envs.VLLM_ASCEND_MOE_OFFLOAD_ENABLED,
             trace_only=envs.VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY,
             num_slots=envs.VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS,
-            policy=envs.VLLM_ASCEND_MOE_OFFLOAD_POLICY,
-            max_phases=envs.VLLM_ASCEND_MOE_OFFLOAD_MAX_PHASES,
-            async_load=envs.VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD,
             trace_max_records=envs.VLLM_ASCEND_MOE_OFFLOAD_TRACE_MAX_RECORDS,
             resident_layer_ids=parse_comma_separated_ints(
                 envs.VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS
             ),
             release_original_expert_weights=envs.VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS,
-            layered_runtime=envs.VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME,
-            fanout_threshold=envs.VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD,
         )
 
     @property
@@ -68,9 +56,3 @@ class MoeOffloadConfig:
     @property
     def should_trace(self) -> bool:
         return self.enabled and self.trace_only
-
-    @property
-    def effective_fanout_threshold(self) -> int:
-        if self.fanout_threshold > 0:
-            return self.fanout_threshold
-        return self.num_slots

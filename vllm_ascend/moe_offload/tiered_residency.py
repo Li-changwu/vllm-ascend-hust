@@ -33,7 +33,7 @@ def parse_comma_separated_ints(raw: str) -> frozenset[int]:
 
 @dataclass(frozen=True)
 class TieredResidencyPolicy:
-    """Decides per-layer execution mode for MVP-D.9.
+    """Decides which MoE layers keep full NPU expert weights.
 
     - Resident layers: keep original ``w13_weight`` / ``w2_weight`` on device;
       fixed-slot plan is skipped (no host→slot load on hot path).

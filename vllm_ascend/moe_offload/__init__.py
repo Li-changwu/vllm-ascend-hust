@@ -28,7 +28,6 @@ from vllm_ascend.moe_offload.runtime import (
 )
 from vllm_ascend.moe_offload.slot_bank import ExpertSlot, ExpertSlotBank, SlotState
 from vllm_ascend.moe_offload.slot_mapping import ExpertSlotMapping, PreparedSlotWeights
-from vllm_ascend.moe_offload.slot_simulator import ExpertSizeTable, SlotSimulationSummary, SlotSimulator
 from vllm_ascend.moe_offload.trace_collector import TraceCollector, TraceRecord
 from vllm_ascend.moe_offload.transfer_engine import TransferEngine
 
@@ -37,7 +36,6 @@ __all__ = [
     "ExpertSlot",
     "ExpertSlotMapping",
     "ExpertSlotBank",
-    "ExpertSizeTable",
     "ExpertWeightBundle",
     "HostExpertStore",
     "LayoutSignature",
@@ -48,8 +46,6 @@ __all__ = [
     "MoeOffloadRuntime",
     "PreparedSlotWeights",
     "SlotState",
-    "SlotSimulationSummary",
-    "SlotSimulator",
     "TraceCollector",
     "TraceRecord",
     "TransferEngine",

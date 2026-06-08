@@ -33,7 +33,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     build_mlp_compute_input,
     build_token_dispatch_input,
 )
-from vllm_ascend.moe_offload.runtime import MoeOffloadDecisionPath, get_moe_offload_runtime
+from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
@@ -174,22 +174,6 @@ class MoECommMethod(ABC):
         active_experts = tuple(
             int(expert_id) for expert_id in torch.unique(fused_experts_input.topk_ids.detach().cpu()).tolist()
         )
-        use_slot_cache_path = True
-        if runtime.should_use_layered_runtime:
-            decision = runtime.decide_layered_path(
-                layer_id=offload.layer_id,
-                active_experts=active_experts,
-            )
-            if decision.path is MoeOffloadDecisionPath.FAIL_CLOSED:
-                raise RuntimeError(
-                    "MoE offload layered runtime failed closed: "
-                    f"layer_id={offload.layer_id}, reason={decision.reason}"
-                )
-            use_slot_cache_path = decision.path is MoeOffloadDecisionPath.SLOT_CACHE_PATH
-
-        if not use_slot_cache_path:
-            return fused_experts_input
-
         prepared_weights = runtime.prepare_fixed_slot_plan(
             layer_id=offload.layer_id,
             active_experts=active_experts,
