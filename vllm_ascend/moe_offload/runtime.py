@@ -140,6 +140,27 @@ class MoeOffloadRuntime:
             return False
         return not self.is_resident_layer(int(layer_id))
 
+    def should_use_slot_cache_for_active_experts(
+        self,
+        *,
+        layer_id: int,
+        active_experts: tuple[int, ...],
+    ) -> bool:
+        if not self.should_use_fixed_slot_plan_for_layer(layer_id):
+            return False
+
+        unique_active_experts = _dedupe_preserve_order(active_experts)
+        if len(unique_active_experts) <= self.config.num_slots:
+            return True
+
+        if self.original_expert_weights_available_for_layer(layer_id):
+            return False
+
+        raise RuntimeError(
+            f"active expert working set size {len(unique_active_experts)} exceeds "
+            f"num_slots={self.config.num_slots} and original expert weights are unavailable"
+        )
+
     def memory_ledger(self) -> MoeOffloadMemoryLedger:
         original_bytes = sum(
             bytes_

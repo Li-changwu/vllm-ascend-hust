@@ -174,6 +174,12 @@ class MoECommMethod(ABC):
         active_experts = tuple(
             int(expert_id) for expert_id in torch.unique(fused_experts_input.topk_ids.detach().cpu()).tolist()
         )
+        if not runtime.should_use_slot_cache_for_active_experts(
+            layer_id=offload.layer_id,
+            active_experts=active_experts,
+        ):
+            return fused_experts_input
+
         prepared_weights = runtime.prepare_fixed_slot_plan(
             layer_id=offload.layer_id,
             active_experts=active_experts,

@@ -81,6 +81,39 @@ def test_runtime_rejects_active_working_set_larger_than_slot_budget_before_loadi
         )
 
 
+def test_runtime_uses_full_weight_path_for_high_fanout_when_original_weights_are_available():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, trace_only=False, num_slots=1))
+    runtime.register_layer_for_fixed_slots(_mock_layer(layer_id=0, num_experts=2), slot_device=torch.device("cpu"))
+
+    assert (
+        runtime.should_use_slot_cache_for_active_experts(
+            layer_id=0,
+            active_experts=(0, 1),
+        )
+        is False
+    )
+
+
+def test_runtime_fails_closed_for_high_fanout_when_original_weights_are_unavailable():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            trace_only=False,
+            num_slots=1,
+            release_original_expert_weights=True,
+        )
+    )
+    layer = _mock_layer(layer_id=0, num_experts=2)
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    runtime.release_original_expert_weights_if_ready(layer)
+
+    with pytest.raises(RuntimeError, match="original expert weights are unavailable"):
+        runtime.should_use_slot_cache_for_active_experts(
+            layer_id=0,
+            active_experts=(0, 1),
+        )
+
+
 def test_runtime_rejects_out_of_range_active_expert_before_host_lookup():
     runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, trace_only=False, num_slots=2))
     runtime.register_layer_for_fixed_slots(_mock_layer(layer_id=0, num_experts=3), slot_device=torch.device("cpu"))
