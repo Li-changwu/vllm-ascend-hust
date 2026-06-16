@@ -50,6 +50,64 @@ vLLM 昇腾插件 (`vllm-ascend`) 是一个由社区维护的让vLLM在Ascend NP
 - Attention、MoE 等关键算子的性能调优
 - 与华为昇腾硬件特性的深度集成
 
+## P0 性能剖析结论：MoE 推理的时间花在哪里
+
+P0 剖析工作（功能一）测量 Ascend NPU 上 MoE 推理各阶段的执行开销，为下游的
+GMM 算子优化与专家卸载工作提供数据依据。下表是单卡非卸载 Qwen3-30B-A3B 在
+mixed 阶段的核心结果（Atlas 800I A2，Ascend PyTorch Profiler）：
+
+| 算子类型 | 总耗时 | 平均 | 占 MoE 算子时间 | Cube 利用率 |
+|---|---:|---:|---:|---:|
+| **GroupedMatmul** | 2099.74 ms | 165.7 us | **62.6%** | 91.2% |
+| MatMulV2 | 401.67 ms | 21.0 us | 12.0% | 68.8% |
+| FusedInferAttentionScore | 179.36 ms | 28.3 us | 5.3% | 86.0% |
+| RmsNorm | 158.03 ms | 12.3 us | 4.7% | 0.0% |
+| MoeInitRoutingCustom | 112.13 ms | 17.7 us | 3.3% | 0.0% |
+
+该工况下端到端指标：中位 TTFT ≈ 1169.6 ms，中位 TPOT ≈ 252.6 ms，输出吞吐
+≈ 37.4 tok/s。
+
+**结论一 —— GroupedMatmul 在 prefill 和 decode 两个阶段都是头号开销，且对
+shape 敏感。** 把同一次运行拆成 prefill 与 decode 两个窗口后可以看到，无论哪个
+阶段 GMM 都是占比最高的单一算子，但其单次调用耗时随 batch 后的 shape 大幅波动：
+
+| 阶段 | GMM 调用数 | GMM 总耗时 | GMM 平均 | GMM 占比 | Cube 利用率 |
+|---|---:|---:|---:|---:|---:|
+| Prefill | 672 | 236.81 ms | **352.4 us** | 59.0% | 95.5% |
+| Decode | 6240 | 725.17 ms | **116.2 us** | 55.9% | 91.0% |
+
+**分析：** 单次调用 3 倍的差距（prefill 352 us vs decode 116 us）来自
+token-per-expert 分布和 group shape 的差异，而**不是 kernel 本身的低效** ——
+Cube 利用率已经达到 91–96%，计算单元基本打满。这意味着真正能撬动性能的杠杆是
+shape（tiling 与 stable-shape grouped-matmul 路径），而非通用算子融合；同时
+prefill（长 prompt、大 group）与 decode（小 group、高频）需要不同的 tiling
+策略，不能用一套参数覆盖两个阶段。
+
+**结论二 —— MoE 时间约 80% 是计算约束（Cube-bound），约 20% 是向量/访存约束
+（vector/MTE-bound）。** 按 Cube 利用率把 top kernel 分成两类，可以清晰区分出
+两条独立的优化轨道：
+
+| 类别 | Mixed | Prefill | Decode |
+|---|---:|---:|---:|
+| 计算约束（AIC：GMM、MatMul、Attention） | **80.5%** | 76.3% | 77.8% |
+| 向量/访存约束（AIV，Cube=0：RmsNorm、routing、permute、slice） | 19.5% | 23.7% | 22.2% |
+
+**分析：** 计算约束的大头由 GMM 主导，是 GMM 算子优化与专家卸载的主战场；剩下的
+向量/访存约束部分（RmsNorm、MoeInitRoutingCustom、MoeGatingTopK、
+MoeTokenUnpermute、Slice —— 路由相关算子在 mixed 窗口合计约 197 ms）则是算子
+融合的候选集：这些都是高频短 kernel，前后常紧邻 norm / bias / swiglu / reshape
+链，具备合并条件。这条占比约 20% 的轨道虽非最大头，但 kernel 数量极多，launch
+与 stream 调度开销不可忽视，是 TPOT 优化的次级目标。
+
+> 关于 wait / MTE 比率的说明：单次运行报告还会给出累计 kernel wait 比率（mixed
+> 为 911.7%）和 MTE 时间比率（mixed 为 90.8%）。这两个值是跨 kernel 与跨 stream
+> 累加的，会超过 100%，因此应当把它们当作**相对的 stream 压力信号**，而不是绝对
+> 的 stall 时间。
+
+复现方式与逐阶段报告见 [benchmarks/README.md](benchmarks/README.md)；每次运行的
+报告会落在 `benchmarks/results/<run>/ascend_moe_profile_report.md`（results 目录
+不纳入版本控制）。
+
 ## 准备
 
 - 硬件：Atlas 800I A2 Inference系列、Atlas A2 Training系列、Atlas 800I A3 Inference系列、Atlas A3 Training系列、Atlas 300I Duo（实验性支持）

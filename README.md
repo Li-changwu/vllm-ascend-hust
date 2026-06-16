@@ -75,13 +75,15 @@ Please use the following recommended versions to get started quickly:
 | v0.19.1rc1 | Latest release candidate | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/latest/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html) for more details |
 | v0.18.0 | Latest stable version | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.18.0/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.18.0/installation.html) for more details |
 
-## P0 性能剖析结论：MoE 推理的时间花在哪里
+## P0 Profiling Findings: Where MoE Inference Spends Its Time
 
-P0 剖析工作（功能一）测量 Ascend NPU 上 MoE 推理各阶段的执行开销，为下游的
-GMM 算子优化与专家卸载工作提供数据依据。下表是单卡非卸载 Qwen3-30B-A3B 在
-mixed 阶段的核心结果（Atlas 800I A2，Ascend PyTorch Profiler）：
+The P0 profiling work (Feature 1) measures the per-stage execution cost of MoE
+inference on Ascend NPU and provides the data basis for the downstream GMM
+kernel optimization and expert offload work. The table below is the headline
+result from the single-card non-offloading Qwen3-30B-A3B mixed-phase profile
+(Atlas 800I A2, Ascend PyTorch Profiler):
 
-| 算子类型 | 总耗时 | 平均 | 占 MoE 算子时间 | Cube 利用率 |
+| OP type | Total | Avg | Share of MoE op time | Cube util |
 |---|---:|---:|---:|---:|
 | **GroupedMatmul** | 2099.74 ms | 165.7 us | **62.6%** | 91.2% |
 | MatMulV2 | 401.67 ms | 21.0 us | 12.0% | 68.8% |
@@ -89,49 +91,55 @@ mixed 阶段的核心结果（Atlas 800I A2，Ascend PyTorch Profiler）：
 | RmsNorm | 158.03 ms | 12.3 us | 4.7% | 0.0% |
 | MoeInitRoutingCustom | 112.13 ms | 17.7 us | 3.3% | 0.0% |
 
-该工况下端到端指标：中位 TTFT ≈ 1169.6 ms，中位 TPOT ≈ 252.6 ms，输出吞吐
-≈ 37.4 tok/s。
+End-to-end at this operating point: median TTFT ≈ 1169.6 ms, median TPOT
+≈ 252.6 ms, output throughput ≈ 37.4 tok/s.
 
-**结论一 —— GroupedMatmul 在 prefill 和 decode 两个阶段都是头号开销，且对
-shape 敏感。** 把同一次运行拆成 prefill 与 decode 两个窗口后可以看到，无论哪个
-阶段 GMM 都是占比最高的单一算子，但其单次调用耗时随 batch 后的 shape 大幅波动：
+**Finding 1 — GroupedMatmul is the dominant cost in both phases, and it is
+shape-sensitive.** Splitting the same run into prefill and decode windows shows
+GMM stays the single largest operator regardless of phase, but its per-call cost
+swings with the batched shape:
 
-| 阶段 | GMM 调用数 | GMM 总耗时 | GMM 平均 | GMM 占比 | Cube 利用率 |
+| Phase | GMM calls | GMM total | GMM avg | GMM share | Cube util |
 |---|---:|---:|---:|---:|---:|
 | Prefill | 672 | 236.81 ms | **352.4 us** | 59.0% | 95.5% |
 | Decode | 6240 | 725.17 ms | **116.2 us** | 55.9% | 91.0% |
 
-**分析：** 单次调用 3 倍的差距（prefill 352 us vs decode 116 us）来自
-token-per-expert 分布和 group shape 的差异，而**不是 kernel 本身的低效** ——
-Cube 利用率已经达到 91–96%，计算单元基本打满。这意味着真正能撬动性能的杠杆是
-shape（tiling 与 stable-shape grouped-matmul 路径），而非通用算子融合；同时
-prefill（长 prompt、大 group）与 decode（小 group、高频）需要不同的 tiling
-策略，不能用一套参数覆盖两个阶段。
+**Analysis:** The 3x per-call gap (352 us prefill vs 116 us decode) comes from
+the token-per-expert distribution and group shapes, **not kernel inefficiency**
+— Cube utilization is already 91–96%, so the compute units are essentially
+saturated. The real lever for performance is therefore the shape (tiling and
+stable-shape grouped-matmul paths), not generic operator fusion; and prefill
+(long prompt, large groups) vs decode (small groups, high frequency) need
+different tiling strategies — one set of parameters cannot cover both phases.
 
-**结论二 —— MoE 时间约 80% 是计算约束（Cube-bound），约 20% 是向量/访存约束
-（vector/MTE-bound）。** 按 Cube 利用率把 top kernel 分成两类，可以清晰区分出
-两条独立的优化轨道：
+**Finding 2 — MoE time is ~80% Cube-bound, ~20% vector/MTE-bound.** Classifying
+the top kernels by Cube utilization separates the two independent optimization
+tracks:
 
-| 类别 | Mixed | Prefill | Decode |
+| Class | Mixed | Prefill | Decode |
 |---|---:|---:|---:|
-| 计算约束（AIC：GMM、MatMul、Attention） | **80.5%** | 76.3% | 77.8% |
-| 向量/访存约束（AIV，Cube=0：RmsNorm、routing、permute、slice） | 19.5% | 23.7% | 22.2% |
+| Cube-bound (AIC: GMM, MatMul, attention) | **80.5%** | 76.3% | 77.8% |
+| Vector/MTE-bound (AIV, Cube=0: RmsNorm, routing, permute, slice) | 19.5% | 23.7% | 22.2% |
 
-**分析：** 计算约束的大头由 GMM 主导，是 GMM 算子优化与专家卸载的主战场；剩下的
-向量/访存约束部分（RmsNorm、MoeInitRoutingCustom、MoeGatingTopK、
-MoeTokenUnpermute、Slice —— 路由相关算子在 mixed 窗口合计约 197 ms）则是算子
-融合的候选集：这些都是高频短 kernel，前后常紧邻 norm / bias / swiglu / reshape
-链，具备合并条件。这条占比约 20% 的轨道虽非最大头，但 kernel 数量极多，launch
-与 stream 调度开销不可忽视，是 TPOT 优化的次级目标。
+**Analysis:** The Cube-bound bulk is GMM-led and is the main battlefield for GMM
+kernel optimization and expert offload. The remaining vector/MTE-bound part
+(RmsNorm, MoeInitRoutingCustom, MoeGatingTopK, MoeTokenUnpermute, Slice — the
+routing family totals ≈ 197 ms in the mixed window) is the operator-fusion
+candidate set: these are high-frequency short kernels often adjacent to
+norm / bias / swiglu / reshape chains, so they meet the structural conditions
+for merging. Although this ~20% track is not the largest share, the kernel count
+is very high, so launch and stream-scheduling overhead cannot be ignored — it is
+the secondary target for TPOT optimization.
 
-> 关于 wait / MTE 比率的说明：单次运行报告还会给出累计 kernel wait 比率（mixed
-> 为 911.7%）和 MTE 时间比率（mixed 为 90.8%）。这两个值是跨 kernel 与跨 stream
-> 累加的，会超过 100%，因此应当把它们当作**相对的 stream 压力信号**，而不是绝对
-> 的 stall 时间。
+> Note on wait/MTE ratios: the per-run report also lists a cumulative kernel
+> wait ratio (911.7% mixed) and an MTE time ratio (90.8% mixed). These are summed
+> across kernels and streams and can exceed 100%, so treat them as relative
+> stream-pressure signals, not absolute stall time.
 
-复现方式与逐阶段报告见 [benchmarks/README.md](benchmarks/README.md)；每次运行的
-报告会落在 `benchmarks/results/<run>/ascend_moe_profile_report.md`（results 目录
-不纳入版本控制）。
+Reproduction steps and per-phase reports are in
+[benchmarks/README.md](benchmarks/README.md); each run's report lands under
+`benchmarks/results/<run>/ascend_moe_profile_report.md` (the results directory
+is not version-controlled).
 
 ## Research Branch MoE Offload Service
 
