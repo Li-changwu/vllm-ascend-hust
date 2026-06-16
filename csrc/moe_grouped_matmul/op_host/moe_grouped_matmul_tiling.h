@@ -20,7 +20,8 @@ TILING_DATA_FIELD_DEF(uint32_t, n);
 TILING_DATA_FIELD_DEF(uint32_t, k);
 TILING_DATA_FIELD_DEF(uint32_t, single_m);
 TILING_DATA_FIELD_DEF(uint32_t, single_n);
-TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mm_tiling);
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mm_tiling);       // bf16 output (keys 10/11)
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mm_tiling_float); // float output (keys 20/21, SwiGLU fusion)
 END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(MoeGroupedMatmul, MoeGroupedMatmulTilingData)
 } // namespace optiling

@@ -15,6 +15,8 @@
 # This file is a part of the vllm-ascend project.
 
 
+from dataclasses import dataclass
+
 import torch
 import torch_npu
 from torch.nn.functional import pad
@@ -320,6 +322,68 @@ def quant_apply_mlp(
     return hidden_states
 
 
+# --- GMM1 in-situ probe (env-gated, default OFF, no behavior change) ---
+# Set VLLM_ASCEND_GMM1_PROBE_BACKEND=custom to route GMM1 (gate/up) through the
+# custom NZ grouped-matmul kernel; set VLLM_ASCEND_GMM1_PROBE_PATH to a file to
+# append per-call synchronized GMM1 latency (ms). Both unset => original path.
+import os as _gmm1_os
+
+_GMM1_PROBE_BACKEND = _gmm1_os.environ.get("VLLM_ASCEND_GMM1_PROBE_BACKEND", "")
+_GMM1_PROBE_PATH = _gmm1_os.environ.get("VLLM_ASCEND_GMM1_PROBE_PATH", "")
+
+
+def _gmm1_custom_nz(hidden_states, w1, group_list, group_list_type):
+    import vllm_ascend.vllm_ascend_C  # noqa: F401
+    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+    if group_list_type == 0:  # cumsum -> counts
+        gl = group_list.to(torch.int64)
+        counts = torch.cat([gl[:1], gl[1:] - gl[:-1]])
+    else:
+        counts = group_list.to(torch.int64)
+    w_nz = torch_npu.npu_format_cast(w1.contiguous(), ACL_FORMAT_FRACTAL_NZ)
+    active_ids = torch.nonzero(counts > 0, as_tuple=False).reshape(-1)
+    active_counts = counts.index_select(0, active_ids)
+    gl_pairs = torch.stack([active_ids, active_counts], dim=1).to(torch.int64)
+    return torch.ops._C_ascend.moe_grouped_matmul(
+        hidden_states, w_nz, gl_pairs, 2, 0, 2,
+    )[0]
+
+
+def _gmm1_run(hidden_states, w1, w1_bias, group_list, group_list_type):
+    use_custom = _GMM1_PROBE_BACKEND == "custom"
+    if not _GMM1_PROBE_PATH:
+        if use_custom:
+            return _gmm1_custom_nz(hidden_states, w1, group_list, group_list_type)
+        return torch_npu.npu_grouped_matmul(
+            x=[hidden_states], weight=[w1],
+            bias=[w1_bias.to(dtype=torch.float32)] if w1_bias is not None else None,
+            split_item=2, group_list_type=group_list_type,
+            group_type=0, group_list=group_list,
+        )[0]
+    # timed path
+    from time import perf_counter
+    torch_npu.npu.synchronize()
+    _t0 = perf_counter()
+    if use_custom:
+        out = _gmm1_custom_nz(hidden_states, w1, group_list, group_list_type)
+    else:
+        out = torch_npu.npu_grouped_matmul(
+            x=[hidden_states], weight=[w1],
+            bias=[w1_bias.to(dtype=torch.float32)] if w1_bias is not None else None,
+            split_item=2, group_list_type=group_list_type,
+            group_type=0, group_list=group_list,
+        )[0]
+    torch_npu.npu.synchronize()
+    _dt_ms = (perf_counter() - _t0) * 1000.0
+    try:
+        with open(_GMM1_PROBE_PATH, "a") as _f:
+            _f.write(f"{_dt_ms}\n")
+    except OSError:
+        pass
+    return out
+
+
 def unquant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -338,15 +402,7 @@ def unquant_apply_mlp(
 
     act_name = getattr(activation, "value", activation)
 
-    gate_up_out = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w1],
-        bias=[w1_bias.to(dtype=torch.float32)] if w1_bias is not None else None,
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-    )[0]
+    gate_up_out = _gmm1_run(hidden_states, w1, w1_bias, group_list, group_list_type)
 
     if act_name == "swigluoai":
         num_experts, _, hidden_size = w1.shape
@@ -447,3 +503,53 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         per_token_scale_type=per_token_scale_type,
         use_bf16=use_bf16,
     )
+
+
+# ── P5: env-var controlled custom GMM1 kernel toggle ─────────────────────────
+# Set VLLM_ASCEND_USE_CUSTOM_GMM=1 to replace torch_npu GMM1 with _C_ascend.
+# This runs at import time so it takes effect inside the vLLM API server process.
+import os as _os
+if _os.environ.get("VLLM_ASCEND_USE_CUSTOM_GMM", "") == "1":
+    import vllm_ascend.vllm_ascend_C as _custom_ops
+
+    _orig_unquant = unquant_apply_mlp
+
+    def _custom_unquant_apply_mlp(
+        hidden_states, w1, w2, group_list,
+        w1_bias=None, w2_bias=None, activation=None,
+        group_list_type=1, topk_scales=None, need_trans=True,
+    ):
+        if need_trans:
+            w1 = w1.transpose(1, 2)
+            w2 = w2.transpose(1, 2)
+        # Custom kernel expects ND format weight (transposed, contiguous)
+        # torch_binding.cpp dispatches to aclnnMoeGroupedMatmul (ND path)
+        w1_nd = w1.contiguous()
+        act_name = getattr(activation, "value", activation)
+        gl = group_list.to(torch.int64) if group_list_type == 1 else group_list
+        if group_list_type == 0:
+            diffs = gl[1:] - gl[:-1]
+            gl = torch.cat([gl[:1], diffs])
+        active_ids = torch.nonzero(gl > 0).reshape(-1).to(torch.int64)
+        active_counts = gl.index_select(0, active_ids.long())
+        gl2 = torch.stack([active_ids, active_counts], dim=1)
+        gate_up_out = torch.ops._C_ascend.moe_grouped_matmul(
+            hidden_states, w1_nd, gl2, 2, 0, 2)[0]
+        if act_name == "swigluoai":
+            gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(
+                gate_up_out.view(-1, w1.shape[2]))
+        else:
+            gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        if topk_scales is not None:
+            gate_up_out = gate_up_out * topk_scales
+        w2_bias_arg = None
+        if w2_bias is not None:
+            w2_bias_arg = [w2_bias.to(dtype=torch.float32)]
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out], weight=[w2],
+            bias=w2_bias_arg,
+            split_item=2, group_list_type=group_list_type,
+            group_type=0, group_list=group_list)[0]
+        return hidden_states
+
+    unquant_apply_mlp = _custom_unquant_apply_mlp

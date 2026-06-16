@@ -18,6 +18,14 @@ target_sources(optiling PRIVATE
         moe_grouped_matmul_cpu.cpp
 )
 
+if(DEFINED ENV{VLLM_ASCEND_MOE_GMM_TILING_DEFINES})
+        separate_arguments(VLLM_ASCEND_MOE_GMM_TILING_DEFINES UNIX_COMMAND
+                "$ENV{VLLM_ASCEND_MOE_GMM_TILING_DEFINES}")
+        target_compile_options(optiling PRIVATE
+                ${VLLM_ASCEND_MOE_GMM_TILING_DEFINES}
+        )
+endif()
+
 target_include_directories(optiling PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${ASCEND_CANN_PACKAGE_PATH}/include

@@ -31,10 +31,6 @@ const aclTensorList *MoeGroupedMatmul(const aclTensorList *x,
     }
     auto out = executor->AllocTensorList(tensorsVec.data(), outLength);
 
-    auto x0_dim_num = x0->GetStorageShape().GetDimNum();
-    auto x0_dim0 = x0->GetStorageShape().GetDim(0);
-    printf("x0_dim_num %d x0_dim0 %d\n", x0_dim_num, x0_dim0);
-
     auto ret = ADD_TO_LAUNCHER_LIST_AICORE(MoeGroupedMatmul,
                                       OP_INPUT(x, weight, groupList),
                                       OP_OUTPUT(out),

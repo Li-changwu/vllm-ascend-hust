@@ -12,8 +12,24 @@
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 
-#define OP_LOGD(nodeName, fmt, ...) printf(fmt, ##__VA_ARGS__); printf("\n")
-#define OP_LOGE(nodeName, fmt, ...) printf(fmt, ##__VA_ARGS__); printf("\n")
+#define OP_LOGD(nodeName, fmt, ...) ((void)0)
+#define OP_LOGE(nodeName, fmt, ...) ((void)0)
+
+#ifndef VLLM_ASCEND_MOE_GMM_BASE_N
+#define VLLM_ASCEND_MOE_GMM_BASE_N 256
+#endif
+
+#ifndef VLLM_ASCEND_MOE_GMM_SINGLE_M
+#define VLLM_ASCEND_MOE_GMM_SINGLE_M 128
+#endif
+
+#ifndef VLLM_ASCEND_MOE_GMM_SINGLE_N
+#define VLLM_ASCEND_MOE_GMM_SINGLE_N 256
+#endif
+
+#ifndef VLLM_ASCEND_MOE_GMM_MAX_BASE_M
+#define VLLM_ASCEND_MOE_GMM_MAX_BASE_M 256
+#endif
 
 constexpr uint32_t X_INDEX = 0;
 constexpr uint32_t WEIGHT_INDEX = 1;
@@ -22,11 +38,11 @@ namespace optiling {
 constexpr uint64_t BEST_L1_PARTA = 256UL * 1024UL;
 constexpr uint64_t BEST_L1_PARTB = 128UL * 1024UL;
 constexpr uint64_t L1_PARTA_SIZE = 256UL * 1024UL;
-constexpr int32_t BEST_BASEN = 256;
+constexpr int32_t BEST_BASEN = VLLM_ASCEND_MOE_GMM_BASE_N;
 constexpr uint64_t DOUBLE_BUFFER_L0A_L0B = 2;
 constexpr uint64_t DOUBLE_BUFFER_STEPKA_STEPKB = 2;
 constexpr uint32_t FP32_DATATYPE_SIZE = 4;
-constexpr int32_t MAX_BASEM = 256;
+constexpr int32_t MAX_BASEM = VLLM_ASCEND_MOE_GMM_MAX_BASE_M;
 
 static inline uint32_t SixteenAlign(uint32_t a, bool up = false) {
     if (up) {
@@ -68,6 +84,7 @@ class TilingMoeGroupedMatmulFunc {
     int64_t k_ = 0L;
     bool transpose_weight = false;
     bool weight_nz = false;
+    bool fuse_swiglu_ = false;  // P5 placeholder: set true when kernel entry supports it
     uint32_t single_m_ = 0;
     uint32_t single_n_ = 0;
     int32_t baseM_ = 0;
@@ -135,7 +152,6 @@ ge::graphStatus TilingMoeGroupedMatmulFunc::GMMSetMMTiling() {
     matmul_tiling::DataType matmul_dtype = static_cast<matmul_tiling::DataType>(x_dtype);
     matmul_tiling::PlatformInfo platformInfo;
     InitPlatformInfo(platformInfo);
-    // matmul_tiling::MatmulApiTiling mm(platformInfo);
     matmul_tiling::MultiCoreMatmulTiling mm(platformInfo);
     mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_dtype, false);
     if (weight_nz) {
@@ -146,13 +162,22 @@ ge::graphStatus TilingMoeGroupedMatmulFunc::GMMSetMMTiling() {
     mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_dtype);
     mm.SetOrgShape(m_, n_, k_);
     mm.SetShape(m_, baseN_, k_);
-    // mm.SetShape(single_m_, single_n_, k_);
     mm.SetFixSplit(baseM_, baseN_, baseK_);
     mm.SetBufferSpace(l1_size, l0c_size, ub_size);
 
     if (mm.GetTiling(tiling_data_.mm_tiling) == -1) {
       OP_LOGE(tiling_context_->GetNodeName(), "matmul getTiling failed.");
       return ge::GRAPH_FAILED;
+    }
+
+    // P5: generate float-output tiling for SwiGLU fusion path (keys 20/21)
+    if (fuse_swiglu_) {
+      mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT);
+      if (mm.GetTiling(tiling_data_.mm_tiling_float) == -1) {
+        OP_LOGE(tiling_context_->GetNodeName(), "matmul float tiling failed.");
+        return ge::GRAPH_FAILED;
+      }
     }
     uint32_t mm_step_ka = 1;
     uint32_t mm_step_kb = 1;
@@ -178,7 +203,6 @@ ge::graphStatus TilingMoeGroupedMatmulFunc::GMMSetMMTiling() {
     tiling_data_.mm_tiling.set_depthB1(mm_depth_b1);  // set precomputed mmDepthB1
     tiling_data_.mm_tiling.set_stepM(step_m);  // set precomputed stepM
     tiling_data_.mm_tiling.set_stepN(step_n);  // set precomputed stepN
-    OP_LOGD(context->GetNodeName(), "GMM_tiling: baseM is %d, baseK is %d, baseN is %d, transpose_weight is %d, weight_nz is %d", baseM_, baseK_, baseN_, transpose_weight, weight_nz);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -217,6 +241,7 @@ ge::graphStatus TilingMoeGroupedMatmulFunc::Init() {
     bool is_single_weight = (tiling_context_->GetDynamicInputTensor(WEIGHT_INDEX, 1) == nullptr);
     bool is_single_y = (tiling_context_->GetOutputShape(1) == nullptr);
     transpose_weight = static_cast<bool>(*(tiling_context_->GetAttrs()->GetAttrPointer<bool>(0)));
+    // P5: fuse_swiglu_ remains false until kernel entry wiring is complete
     if (!(is_single_x && is_single_weight && is_single_y)) {
       OP_LOGE(tiling_context_->GetNodeName(), "only support singlex and singleweight and singley.");
       return ge::GRAPH_FAILED;
@@ -230,7 +255,6 @@ ge::graphStatus TilingMoeGroupedMatmulFunc::Init() {
     auto weight_format = static_cast<ge::Format>(ge::GetPrimaryFormat(weight_desc->GetStorageFormat()));
     x_dtype = tiling_context_->GetDynamicInputDesc(X_INDEX, 0)->GetDataType();
 
-    // printf("weight_format %d\n", weight_format);
     weight_nz = weight_format == ge::FORMAT_FRACTAL_NZ;
 
     // check input shape
@@ -253,8 +277,8 @@ ge::graphStatus TilingMoeGroupedMatmulFunc::Init() {
     if (weight_shape.GetDim(0) != group_num_) {
       OP_LOGE(tiling_context_->GetNodeName(), "the dim0 of input weight should be equal to input groupList, but got %zu, %zu.", static_cast<size_t>(weight_shape.GetDim(0)), static_cast<size_t>(group_list_shape.GetDim(0)));
     }
-    single_m_ = 128;
-    single_n_ = 256;
+    single_m_ = VLLM_ASCEND_MOE_GMM_SINGLE_M;
+    single_n_ = VLLM_ASCEND_MOE_GMM_SINGLE_N;
 
     core_num_ = aic_num;
     auto n_task_num = (n_ + single_n_ - 1) / single_n_;
@@ -272,6 +296,9 @@ void TilingMoeGroupedMatmulFunc::SetTilingKey() {
     uint64_t tiling_key = 10UL;
     if (transpose_weight) {
       tiling_key = tiling_key + 1UL;
+    }
+    if (fuse_swiglu_) {
+      tiling_key += 10UL;
     }
     tiling_context_->SetTilingKey(tiling_key);
 }
@@ -333,4 +360,3 @@ IMPL_OP_OPTILING(MoeGroupedMatmul)
     .TilingParse<MatmulAllreduceAddRmsnormCompileInfo1>(TilingParseForMatmulAllreduceAddRmsnorm1);
 
 } // namespace optiling
-

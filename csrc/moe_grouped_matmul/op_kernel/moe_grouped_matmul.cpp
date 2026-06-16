@@ -18,15 +18,15 @@ constexpr CubeFormat formatWeight = CubeFormat::ND;
 #endif
 
 //using namespace matmul;
-#define GMM_CUBE_IMP(transWeight)                                                      \
+#define GMM_CUBE_IMP(transWeight, FuseSwiglu)                                                      \
     do {                                                                                                           \
         if ASCEND_IS_AIV {                                                                                         \
             return;                                                                                                \
         }                                                                                                          \
         GET_TILING_DATA(tiling_data, tiling);                                                                      \
         AscendC::TPipe pipe;                                                                                       \
-        KernelMoeGMMNoQuant<DTYPE_X, DTYPE_GROUP_LIST, formatWeight, transWeight> op(&pipe);                       \
-        op.Init(x, weight, group_list, y, &tiling_data);                                                     \
+        KernelMoeGMMNoQuant<DTYPE_X, DTYPE_GROUP_LIST, formatWeight, transWeight, FuseSwiglu> op(&pipe);            \
+        op.Init(x, weight, group_list, y, workSpace, &tiling_data);                                                \
         op.Process();                                                                                              \
     } while (0)
 
@@ -34,8 +34,25 @@ extern "C" __global__ __aicore__ void moe_grouped_matmul(GM_ADDR x, GM_ADDR weig
                    GM_ADDR workSpace, GM_ADDR tiling) {
 
   if (TILING_KEY_IS(10UL)) {
-    GMM_CUBE_IMP(false);
+    GMM_CUBE_IMP(false, false);
   } else if (TILING_KEY_IS(11UL)) {
-    GMM_CUBE_IMP(true);
+    GMM_CUBE_IMP(true, false);
   }
 }
+
+// P5: GMM1+SwiGLU fusion kernel entry — DISABLED until DataCopy float→bf16
+// API compatibility is resolved for CANN 8.5.1.
+// The cross-type DataCopy(GlobalTensor<bf16>, LocalTensor<float>, ...) requires
+// DataCopyCO12DstParams which has complex stride/quant fields needing
+// careful validation against ascend910b MTE3 hardware constraints.
+// See moe_grouped_matmul.h:232 for the DataCopy call that needs fixing.
+#if 0
+extern "C" __global__ __aicore__ void moe_grouped_matmul_swiglu(GM_ADDR x, GM_ADDR weight,
+                   GM_ADDR group_list, GM_ADDR y, GM_ADDR workSpace, GM_ADDR tiling) {
+  if (TILING_KEY_IS(10UL)) {
+    GMM_CUBE_IMP(false, true);
+  } else if (TILING_KEY_IS(11UL)) {
+    GMM_CUBE_IMP(true, true);
+  }
+}
+#endif

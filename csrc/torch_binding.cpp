@@ -966,7 +966,7 @@ std::vector<at::Tensor> moe_grouped_matmul(
 )
 {
     bool transpose_weight = false;
-    bool weight_nz = true;
+    bool weight_nz = false;
 
     at::TensorList x_list = at::TensorList(x);
     at::TensorList weight_list = at::TensorList(weight);
