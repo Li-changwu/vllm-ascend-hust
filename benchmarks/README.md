@@ -179,15 +179,50 @@ PyTorch Profiler):
 End-to-end at this operating point: median TTFT ≈ 1169.6 ms, median TPOT
 ≈ 252.6 ms, output throughput ≈ 37.4 tok/s.
 
+**Finding 1 — GroupedMatmul is the dominant cost in both phases, and it is
+shape-sensitive.** Splitting the same run into prefill and decode windows shows
+GMM stays the single largest operator regardless of phase, but its per-call
+cost swings with batched shape:
+
+| Phase | GMM calls | GMM total | GMM avg | GMM share | Cube util |
+|---|---:|---:|---:|---:|---:|
+| Prefill | 672 | 236.81 ms | **352.4 us** | 59.0% | 95.5% |
+| Decode | 6240 | 725.17 ms | **116.2 us** | 55.9% | 91.0% |
+
+The 3x per-call gap (352 us prefill vs 116 us decode) is driven by
+token-per-expert distribution and group shapes, not kernel inefficiency — Cube
+utilization is already 91–96%. This is why the GMM work
+(`feature/gmm-kernel-opt`) targets **tiling and stable-shape grouped-matmul
+paths** rather than generic fusion: the kernel is busy, the shapes are the lever.
+
+**Finding 2 — MoE time is ~80% Cube-bound, ~20% vector/MTE-bound.** Classifying
+the top kernels by Cube utilization separates the two optimization tracks:
+
+| Class | Mixed | Prefill | Decode |
+|---|---:|---:|---:|
+| Cube-bound (AIC: GMM, MatMul, attention) | **80.5%** | 76.3% | 77.8% |
+| Vector/MTE-bound (AIV, Cube=0: RmsNorm, routing, permute, slice) | 19.5% | 23.7% | 22.2% |
+
+The Cube-bound bulk is GMM-led and motivates the kernel + offload branches. The
+vector/MTE-bound remainder (RmsNorm, MoeInitRoutingCustom, MoeGatingTopK,
+MoeTokenUnpermute, Slice — routing family ≈ 197 ms in the mixed window) is the
+**fusion candidate set**: high-frequency short kernels with adjacent
+norm/bias/swiglu/reshape chains.
+
 Takeaways that drive the other two branches:
 
-- **GroupedMatmul dominates (62.6%)** of MoE operator time with high Cube
-  utilization (91.2%) but also large wait time (976 ms) — the primary target
-  for the custom GMM kernel work (`feature/gmm-kernel-opt`).
+- **GroupedMatmul dominates (62.6%)** with high Cube utilization (91.2%), so the
+  win comes from feeding it better shapes — the target of the custom GMM kernel
+  work (`feature/gmm-kernel-opt`).
 - The two grouped matmul stages (GMM1 gate/up, GMM2 down) are where both
   per-expert compute and HBM-resident expert weight access concentrate, which
   is what the expert-offload runtime (`feature/moe-offload-runtime`) restructures
   when HBM cannot hold all experts.
+
+> Note on wait/MTE ratios: the per-run report also lists a cumulative kernel
+> wait ratio (911.7% mixed) and an MTE time ratio (90.8% mixed). These are summed
+> across kernels and streams and can exceed 100%, so treat them as relative
+> stream-pressure signals, not absolute stall time.
 
 Reproduce the report with the profiling suite below; per-run reports land under
 `benchmarks/results/<run>/ascend_moe_profile_report.md` (results dir is not
