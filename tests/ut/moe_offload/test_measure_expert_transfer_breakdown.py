@@ -9,6 +9,7 @@ from tools.sew_offload.measure_expert_transfer_breakdown import (
     infer_expert_shape_from_config,
     linear_fit,
     make_breakdown,
+    parse_batch_expert_counts,
     parse_size_factors,
     summarize_api_statistic_csv,
     summarize_pcie_csv,
@@ -23,6 +24,17 @@ def test_parse_size_factors_requires_multiple_positive_values():
         parse_size_factors("1")
     with pytest.raises(ValueError, match="positive"):
         parse_size_factors("1,0")
+
+
+def test_parse_batch_expert_counts_requires_unique_positive_values():
+    assert parse_batch_expert_counts("2,4,8,16") == (2, 4, 8, 16)
+
+    with pytest.raises(ValueError, match="at least one"):
+        parse_batch_expert_counts("")
+    with pytest.raises(ValueError, match="positive"):
+        parse_batch_expert_counts("2,0")
+    with pytest.raises(ValueError, match="unique"):
+        parse_batch_expert_counts("2,2")
 
 
 def test_infer_expert_shape_from_qwen3_moe_config(tmp_path):
@@ -94,6 +106,9 @@ def test_summarize_trace_copy_patterns_groups_acl_memcpy_by_window(tmp_path):
                 {"ph": "X", "name": "aten::copy_", "ts": "3050", "dur": 350},
                 {"ph": "X", "name": "AscendCL@aclrtMemcpy", "ts": "3100", "dur": 300},
                 {"ph": "X", "name": "AscendCL@aclrtMemcpy", "ts": "3500", "dur": 400},
+                {"ph": "X", "name": "sew_transfer_two", "ts": "7000", "dur": 1000},
+                {"ph": "X", "name": "AscendCL@aclrtMemcpy", "ts": "7100", "dur": 100},
+                {"ph": "X", "name": "AscendCL@aclrtMemcpy", "ts": "7300", "dur": 200},
                 {"ph": "X", "name": "AscendCL@aclrtMemcpy", "ts": "6000", "dur": 999},
             ]
         ),
@@ -114,6 +129,7 @@ def test_summarize_trace_copy_patterns_groups_acl_memcpy_by_window(tmp_path):
                 bytes_per_iteration=2_000_000,
                 copy_calls_per_iteration=2,
                 repeats=1,
+                experts_per_iteration=2,
             ),
         ],
         pcie_peak_gbps=64.0,
@@ -128,10 +144,18 @@ def test_summarize_trace_copy_patterns_groups_acl_memcpy_by_window(tmp_path):
     assert single["pcie_trace_counters"]["PCIe_cpl"]["Rx"]["max_gbps"] == pytest.approx(64.0)
 
     two = summary["two"]
-    assert two["aclrt_memcpy_count"] == 2
+    assert two["total_experts"] == 4
+    assert two["aclrt_memcpy_count"] == 4
     assert two["aclrt_memcpy_expected_count_delta"] == 0
-    assert two["aclrt_memcpy_us"] == pytest.approx(700)
-    assert two["aclrt_memcpy_us_per_call"] == pytest.approx(350)
+    assert two["aclrt_memcpy_us"] == pytest.approx(1000)
+    assert two["record_window_us_per_expert"] == pytest.approx(750)
+    assert two["aclrt_memcpy_us_per_expert"] == pytest.approx(250)
+    assert two["host_window_non_memcpy_us_per_expert"] == pytest.approx(500)
+    assert two["aclrt_memcpy_us_per_call"] == pytest.approx(250)
+    assert two["sample_summary"]["samples"] == 2
+    assert two["sample_summary"]["record_window_ms_per_expert"]["mean"] == pytest.approx(0.75)
+    assert two["sample_summary"]["aclrt_memcpy_ms_per_expert"]["mean"] == pytest.approx(0.25)
+    assert two["sample_summary"]["overhead_ms_per_expert"]["mean"] == pytest.approx(0.5)
 
 
 def test_summarize_profiler_csv_outputs(tmp_path):

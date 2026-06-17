@@ -27,7 +27,7 @@ DEFAULT_MODEL = "/data/shared-models/Qwen3-30B-A3B"
 DEFAULT_SIZE_FACTORS = "0.0625,0.125,0.25,0.5,1,2,4"
 DEFAULT_PCIE_PEAK_GBPS = 64.0
 DEFAULT_PROFILE_REPEATS = 200
-DEFAULT_BATCH_EXPERTS = 8
+DEFAULT_BATCH_EXPERT_COUNTS = "2,4,8,16"
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,8 @@ class CopyPatternSpec:
     bytes_per_iteration: int
     copy_calls_per_iteration: int
     repeats: int
+    experts_per_iteration: int = 1
+    copies_per_sample: int = 1
 
 
 def parse_size_factors(value: str) -> tuple[float, ...]:
@@ -73,6 +75,17 @@ def parse_size_factors(value: str) -> tuple[float, ...]:
     if any(factor <= 0 for factor in factors):
         raise ValueError("size factors must be positive")
     return factors
+
+
+def parse_batch_expert_counts(value: str) -> tuple[int, ...]:
+    counts = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not counts:
+        raise ValueError("at least one batch expert count is required")
+    if any(count <= 0 for count in counts):
+        raise ValueError("batch expert counts must be positive")
+    if len(set(counts)) != len(counts):
+        raise ValueError("batch expert counts must be unique")
+    return counts
 
 
 def infer_expert_shape_from_config(model: str | Path, *, dtype_name: str | None = None) -> ExpertShape:
@@ -158,6 +171,8 @@ def make_breakdown(
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "batch_experts", None) is not None:
+        args.batch_expert_counts = str(args.batch_experts)
     torch = _import_torch(args.device)
     device = torch.device(args.device)
     shape = _shape_from_args(args)
@@ -253,8 +268,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             pin_memory=args.pin_memory,
             profile_output_dir=Path(args.profile_output_dir),
             profile_repeats=args.profile_repeats,
+            profile_copies_per_sample=args.profile_copies_per_sample,
             profile_warmup=args.profile_warmup,
-            batch_experts=args.batch_experts,
+            batch_expert_counts=parse_batch_expert_counts(args.batch_expert_counts),
             pcie_peak_gbps=args.pcie_peak_gbps,
         )
 
@@ -340,7 +356,13 @@ def parse_args() -> argparse.Namespace:
         "--profile-repeats",
         type=int,
         default=DEFAULT_PROFILE_REPEATS,
-        help="Iterations per profiler copy pattern.",
+        help="Profile samples per copy pattern.",
+    )
+    parser.add_argument(
+        "--profile-copies-per-sample",
+        type=int,
+        default=1,
+        help="Copy iterations grouped into each profiled sample window.",
     )
     parser.add_argument(
         "--profile-warmup",
@@ -351,8 +373,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-experts",
         type=int,
-        default=DEFAULT_BATCH_EXPERTS,
-        help="Expert payloads copied by the batched contiguous profiler pattern.",
+        default=None,
+        help="Deprecated alias for --batch-expert-counts with a single value.",
+    )
+    parser.add_argument(
+        "--batch-expert-counts",
+        default=DEFAULT_BATCH_EXPERT_COUNTS,
+        help="Comma-separated expert counts copied by contiguous profiler batch patterns.",
     )
     parser.add_argument("--pcie-peak-gbps", type=float, default=DEFAULT_PCIE_PEAK_GBPS)
     parser.add_argument("--output")
@@ -462,18 +489,23 @@ def _run_profiler_copy_patterns(
     pin_memory: bool,
     profile_output_dir: Path,
     profile_repeats: int,
+    profile_copies_per_sample: int,
     profile_warmup: int,
-    batch_experts: int,
+    batch_expert_counts: tuple[int, ...],
     pcie_peak_gbps: float | None,
 ) -> dict[str, Any]:
     if device.type != "npu":
         raise ValueError("torch-npu/CANN profiler patterns require an npu device")
     if profile_repeats <= 0:
         raise ValueError("--profile-repeats must be positive")
+    if profile_copies_per_sample <= 0:
+        raise ValueError("--profile-copies-per-sample must be positive")
     if profile_warmup < 0:
         raise ValueError("--profile-warmup must be non-negative")
-    if batch_experts <= 0:
-        raise ValueError("--batch-experts must be positive")
+    if not batch_expert_counts:
+        raise ValueError("--batch-expert-counts must not be empty")
+    if any(count <= 0 for count in batch_expert_counts):
+        raise ValueError("--batch-expert-counts must be positive")
 
     import torch_npu
     from torch.profiler import record_function
@@ -497,13 +529,6 @@ def _run_profiler_copy_patterns(
         w2_shape=shape.w2_shape,
         pin_memory=pin_memory,
     )
-    batched_src, batched_dst = _allocate_buffer(
-        torch=torch,
-        dtype=dtype,
-        device=device,
-        elements=expert_elements * batch_experts,
-        pin_memory=pin_memory,
-    )
     patterns = [
         {
             "spec": CopyPatternSpec(
@@ -511,6 +536,8 @@ def _run_profiler_copy_patterns(
                 bytes_per_iteration=expert_bytes,
                 copy_calls_per_iteration=1,
                 repeats=profile_repeats,
+                experts_per_iteration=1,
+                copies_per_sample=profile_copies_per_sample,
             ),
             "fn": lambda src=single_src, dst=single_dst: _copy_buffer(src, dst),
         },
@@ -520,19 +547,33 @@ def _run_profiler_copy_patterns(
                 bytes_per_iteration=expert_bytes,
                 copy_calls_per_iteration=2,
                 repeats=profile_repeats,
+                experts_per_iteration=1,
+                copies_per_sample=profile_copies_per_sample,
             ),
             "fn": lambda: _copy_pair(src_w13, src_w2, dst_w13, dst_w2),
         },
-        {
-            "spec": CopyPatternSpec(
-                name="batched_contiguous_experts",
-                bytes_per_iteration=expert_bytes * batch_experts,
-                copy_calls_per_iteration=1,
-                repeats=profile_repeats,
-            ),
-            "fn": lambda src=batched_src, dst=batched_dst: _copy_buffer(src, dst),
-        },
     ]
+    for batch_experts in batch_expert_counts:
+        batched_src, batched_dst = _allocate_buffer(
+            torch=torch,
+            dtype=dtype,
+            device=device,
+            elements=expert_elements * batch_experts,
+            pin_memory=pin_memory,
+        )
+        patterns.append(
+            {
+                "spec": CopyPatternSpec(
+                    name=f"batch_{batch_experts}_expert_contiguous",
+                    bytes_per_iteration=expert_bytes * batch_experts,
+                    copy_calls_per_iteration=1,
+                    repeats=profile_repeats,
+                    experts_per_iteration=batch_experts,
+                    copies_per_sample=profile_copies_per_sample,
+                ),
+                "fn": lambda src=batched_src, dst=batched_dst: _copy_buffer(src, dst),
+            }
+        )
 
     for pattern in patterns:
         fn = pattern["fn"]
@@ -568,10 +609,11 @@ def _run_profiler_copy_patterns(
     ) as profiler:
         for pattern in patterns:
             spec = pattern["spec"]
-            with record_function(f"sew_transfer_{spec.name}"):
-                for _ in range(profile_repeats):
-                    pattern["fn"]()
-                _synchronize(torch, device.type)
+            for sample_index in range(profile_repeats):
+                with record_function(f"sew_transfer_{spec.name}"):
+                    for _ in range(profile_copies_per_sample):
+                        pattern["fn"]()
+                    _synchronize(torch, device.type)
             profiler.step()
 
     _synchronize(torch, device.type)
@@ -723,15 +765,33 @@ def summarize_trace_copy_patterns(
         memcpy_us = sum(_event_duration_us(event) for event in in_memcpy)
         sync_us = sum(_event_duration_us(event) for event in in_sync)
         aten_copy_us = sum(_event_duration_us(event) for event in in_aten_copy)
-        total_bytes = spec.bytes_per_iteration * spec.repeats
+        actual_samples = len(window_ranges)
+        total_iterations = actual_samples * spec.copies_per_sample
+        total_bytes = spec.bytes_per_iteration * total_iterations
         memcpy_ms = memcpy_us / 1000.0
         window_ms = window_us / 1000.0
-        expected_copy_calls = spec.copy_calls_per_iteration * spec.repeats
+        expected_copy_calls = spec.copy_calls_per_iteration * total_iterations
         host_non_memcpy_us = window_us - memcpy_us
         host_other_us = window_us - memcpy_us - sync_us
+        total_experts = spec.experts_per_iteration * total_iterations
+        window_us_per_expert = _safe_div(window_us, total_experts)
+        memcpy_us_per_expert = _safe_div(memcpy_us, total_experts)
+        non_memcpy_us_per_expert = _safe_div(host_non_memcpy_us, total_experts)
+        host_other_us_per_expert = _safe_div(host_other_us, total_experts)
+        sync_us_per_expert = _safe_div(sync_us, total_experts)
+        sample_summary = _summarize_copy_pattern_samples(
+            spec=spec,
+            window_ranges=window_ranges,
+            memcpy_events=memcpy_events,
+            sync_events=sync_events,
+            aten_copy_events=aten_copy_events,
+        )
         results[pattern_name] = {
             "bytes_per_iteration": spec.bytes_per_iteration,
+            "experts_per_iteration": spec.experts_per_iteration,
+            "copies_per_sample": spec.copies_per_sample,
             "total_bytes": total_bytes,
+            "total_experts": total_experts,
             "total_mib": total_bytes / (1024**2),
             "repeats": spec.repeats,
             "copy_calls_per_iteration": spec.copy_calls_per_iteration,
@@ -739,10 +799,12 @@ def summarize_trace_copy_patterns(
             "record_window_count": len(pattern_windows),
             "record_window_us": window_us,
             "record_window_us_per_iteration": _safe_div(window_us, spec.repeats),
+            "record_window_us_per_expert": window_us_per_expert,
             "aclrt_memcpy_count": len(in_memcpy),
             "aclrt_memcpy_expected_count_delta": len(in_memcpy) - expected_copy_calls,
             "aclrt_memcpy_us": memcpy_us,
             "aclrt_memcpy_us_per_iteration": _safe_div(memcpy_us, spec.repeats),
+            "aclrt_memcpy_us_per_expert": memcpy_us_per_expert,
             "aclrt_memcpy_us_per_call": _safe_div(memcpy_us, len(in_memcpy)),
             "aclrt_memcpy_us_summary": summarize_values([_event_duration_us(event) for event in in_memcpy]),
             "aclrt_memcpy_bandwidth_gbps": _gbps(total_bytes, memcpy_ms),
@@ -754,18 +816,25 @@ def summarize_trace_copy_patterns(
                 _gbps(total_bytes, window_ms) / pcie_peak_gbps if pcie_peak_gbps else None
             ),
             "host_window_non_memcpy_us": host_non_memcpy_us,
+            "host_window_non_memcpy_us_per_expert": non_memcpy_us_per_expert,
             "host_window_non_memcpy_fraction": (
                 host_non_memcpy_us / window_us if window_us > 0 else None
             ),
             "aclrt_synchronize_count": len(in_sync),
             "aclrt_synchronize_us": sync_us,
+            "aclrt_synchronize_us_per_expert": sync_us_per_expert,
             "aten_copy_count": len(in_aten_copy),
             "aten_copy_us": aten_copy_us,
+            "sample_summary": sample_summary,
             "time_breakdown": {
                 "record_window_us": window_us,
                 "aclrt_memcpy_us": memcpy_us,
                 "aclrt_synchronize_us": sync_us,
                 "host_other_us": host_other_us,
+                "record_window_us_per_expert": window_us_per_expert,
+                "aclrt_memcpy_us_per_expert": memcpy_us_per_expert,
+                "aclrt_synchronize_us_per_expert": sync_us_per_expert,
+                "host_other_us_per_expert": host_other_us_per_expert,
                 "aclrt_memcpy_fraction": memcpy_us / window_us if window_us > 0 else None,
                 "aclrt_synchronize_fraction": sync_us / window_us if window_us > 0 else None,
                 "host_other_fraction": host_other_us / window_us if window_us > 0 else None,
@@ -807,6 +876,74 @@ def summarize_pcie_csv(path: Path, *, pcie_peak_gbps: float | None) -> dict[str,
             )
         summary[mode] = values
     return summary
+
+
+def _summarize_copy_pattern_samples(
+    *,
+    spec: CopyPatternSpec,
+    window_ranges: list[tuple[float, float]],
+    memcpy_events: list[dict[str, Any]],
+    sync_events: list[dict[str, Any]],
+    aten_copy_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    expected_copy_calls_per_sample = spec.copy_calls_per_iteration * spec.copies_per_sample
+    bytes_per_sample = spec.bytes_per_iteration * spec.copies_per_sample
+    experts_per_sample = spec.experts_per_iteration * spec.copies_per_sample
+    samples: list[dict[str, float | int]] = []
+    for start, stop in window_ranges:
+        sample_range = [(start, stop)]
+        sample_memcpy_events = _events_in_ranges(memcpy_events, sample_range)
+        sample_sync_events = _events_in_ranges(sync_events, sample_range)
+        sample_aten_copy_events = _events_in_ranges(aten_copy_events, sample_range)
+        window_us = stop - start
+        memcpy_us = sum(_event_duration_us(event) for event in sample_memcpy_events)
+        sync_us = sum(_event_duration_us(event) for event in sample_sync_events)
+        aten_copy_us = sum(_event_duration_us(event) for event in sample_aten_copy_events)
+        overhead_us = window_us - memcpy_us
+        samples.append(
+            {
+                "record_window_ms_per_expert": _us_per_expert_to_ms(window_us, experts_per_sample),
+                "aclrt_memcpy_ms_per_expert": _us_per_expert_to_ms(memcpy_us, experts_per_sample),
+                "overhead_ms_per_expert": _us_per_expert_to_ms(overhead_us, experts_per_sample),
+                "aclrt_synchronize_ms_per_expert": _us_per_expert_to_ms(sync_us, experts_per_sample),
+                "aten_copy_ms_per_expert": _us_per_expert_to_ms(aten_copy_us, experts_per_sample),
+                "aclrt_memcpy_bandwidth_gbps": _gbps(bytes_per_sample, memcpy_us / 1000.0),
+                "record_window_bandwidth_gbps": _gbps(bytes_per_sample, window_us / 1000.0),
+                "aclrt_memcpy_count": len(sample_memcpy_events),
+                "aclrt_memcpy_expected_count_delta": len(sample_memcpy_events)
+                - expected_copy_calls_per_sample,
+            }
+        )
+
+    def summarize_field(field: str) -> dict[str, float]:
+        return summarize_values([float(sample[field]) for sample in samples])
+
+    deltas = [int(sample["aclrt_memcpy_expected_count_delta"]) for sample in samples]
+    return {
+        "samples": len(samples),
+        "expected_copy_calls_per_sample": expected_copy_calls_per_sample,
+        "bytes_per_sample": bytes_per_sample,
+        "experts_per_sample": experts_per_sample,
+        "record_window_ms_per_expert": summarize_field("record_window_ms_per_expert"),
+        "aclrt_memcpy_ms_per_expert": summarize_field("aclrt_memcpy_ms_per_expert"),
+        "overhead_ms_per_expert": summarize_field("overhead_ms_per_expert"),
+        "aclrt_synchronize_ms_per_expert": summarize_field("aclrt_synchronize_ms_per_expert"),
+        "aten_copy_ms_per_expert": summarize_field("aten_copy_ms_per_expert"),
+        "aclrt_memcpy_bandwidth_gbps": summarize_field("aclrt_memcpy_bandwidth_gbps"),
+        "record_window_bandwidth_gbps": summarize_field("record_window_bandwidth_gbps"),
+        "aclrt_memcpy_expected_count_delta": {
+            "min": min(deltas) if deltas else 0,
+            "max": max(deltas) if deltas else 0,
+            "nonzero_samples": sum(1 for delta in deltas if delta != 0),
+        },
+    }
+
+
+def _us_per_expert_to_ms(us: float, experts: int) -> float:
+    value = _safe_div(us, experts)
+    if value is None:
+        return 0.0
+    return value / 1000.0
 
 
 def summarize_api_statistic_csv(path: Path) -> dict[str, Any]:
