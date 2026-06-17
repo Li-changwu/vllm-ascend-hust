@@ -99,6 +99,33 @@ MoeTokenUnpermute、Slice —— 路由相关算子在 mixed 窗口合计约 197
 链，具备合并条件。这条占比约 20% 的轨道虽非最大头，但 kernel 数量极多，launch
 与 stream 调度开销不可忽视，是 TPOT 优化的次级目标。
 
+**结论三 —— 专家卸载搬运主要由 host-to-device memcpy 主导；连续 batch 搬运是主要
+优化杠杆，CPU pinned 源内存主要改善小 batch 的稳定性。** 基于 Qwen3-30B-A3B 的
+专家搬运 micro-profile，每个 pattern 采集 100 个独立 CANN profiler 窗口。单个
+expert payload 为 9.0 MiB（bf16）。下表中的 `pin` 仅表示 PyTorch CPU
+`pin_memory=True` 的 host 分配对照，不代表 Ascend UVA。
+
+| 搬运模式 | 源内存 | 每专家总时间 | 每专家 memcpy | 每专家开销 | memcpy 带宽 |
+|---|---|---:|---:|---:|---:|
+| 当前 two-tensor copy | no-pin | 1.1243 ms | 0.8121 ms | 0.3122 ms | 12.17 GB/s |
+| 当前 two-tensor copy | pin | 0.7795 ms | 0.5154 ms | 0.2641 ms | 18.48 GB/s |
+| 4-expert 连续 batch | no-pin | 0.5743 ms | 0.4798 ms | 0.0944 ms | 19.67 GB/s |
+| 4-expert 连续 batch | pin | 0.5081 ms | 0.4055 ms | 0.1026 ms | 23.29 GB/s |
+| 8-expert 连续 batch | no-pin | 0.5001 ms | 0.4408 ms | 0.0593 ms | 21.41 GB/s |
+| 8-expert 连续 batch | pin | 0.4483 ms | 0.3961 ms | 0.0522 ms | 23.83 GB/s |
+| 16-expert 连续 batch | no-pin | 0.4807 ms | 0.4457 ms | 0.0350 ms | 21.17 GB/s |
+| 16-expert 连续 batch | pin | 0.4197 ms | 0.3879 ms | 0.0318 ms | 24.33 GB/s |
+
+**分析：** 当前卸载 miss 路径会把一个专家拆成 w13 / w2 两个 tensor 搬运，因此每专家
+仍有明显的调度与同步开销（no-pin 0.31 ms，pin 0.26 ms）。把多个专家打包成一次
+连续搬运可以摊薄这部分开销：no-pin 从当前路径的 1.1243 ms/expert 降到 16-expert
+batch 的 0.4807 ms/expert（2.34x），pin 从 0.7795 ms/expert 降到
+0.4197 ms/expert（1.86x）。CPU pinned 源内存对小 copy 路径收益最大：当前路径总
+时间降低 30.7%，2-expert batch 降低 52.8%；但到 4–16 expert 后，搬运主要进入
+带宽约束区间，剩余收益约 10–13%。同时 no-pin 小 batch 有明显长尾，而 4/8/16
+expert 连续 batch 的波动很小，因此专家卸载设计应优先做连续 batch 搬运，再把
+pinning 作为辅助优化旋钮。
+
 > 关于 wait / MTE 比率的说明：单次运行报告还会给出累计 kernel wait 比率（mixed
 > 为 911.7%）和 MTE 时间比率（mixed 为 90.8%）。这两个值是跨 kernel 与跨 stream
 > 累加的，会超过 100%，因此应当把它们当作**相对的 stream 压力信号**，而不是绝对

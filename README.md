@@ -131,6 +131,36 @@ for merging. Although this ~20% track is not the largest share, the kernel count
 is very high, so launch and stream-scheduling overhead cannot be ignored — it is
 the secondary target for TPOT optimization.
 
+**Finding 3 — Expert offload is dominated by host-to-device memcpy; contiguous
+batching is the main transfer lever, while CPU pinned source memory mainly
+stabilizes small batches.** A Qwen3-30B-A3B expert transfer micro-profile was
+run with 100 independent CANN profiler windows per pattern. Each expert payload
+is 9.0 MiB (bf16). The `pin` rows use PyTorch CPU `pin_memory=True` as a host
+allocation control only; this is not Ascend UVA.
+
+| Transfer pattern | Source | Total / expert | Memcpy / expert | Overhead / expert | Memcpy BW |
+|---|---|---:|---:|---:|---:|
+| Current two-tensor copy | no-pin | 1.1243 ms | 0.8121 ms | 0.3122 ms | 12.17 GB/s |
+| Current two-tensor copy | pin | 0.7795 ms | 0.5154 ms | 0.2641 ms | 18.48 GB/s |
+| 4-expert contiguous batch | no-pin | 0.5743 ms | 0.4798 ms | 0.0944 ms | 19.67 GB/s |
+| 4-expert contiguous batch | pin | 0.5081 ms | 0.4055 ms | 0.1026 ms | 23.29 GB/s |
+| 8-expert contiguous batch | no-pin | 0.5001 ms | 0.4408 ms | 0.0593 ms | 21.41 GB/s |
+| 8-expert contiguous batch | pin | 0.4483 ms | 0.3961 ms | 0.0522 ms | 23.83 GB/s |
+| 16-expert contiguous batch | no-pin | 0.4807 ms | 0.4457 ms | 0.0350 ms | 21.17 GB/s |
+| 16-expert contiguous batch | pin | 0.4197 ms | 0.3879 ms | 0.0318 ms | 24.33 GB/s |
+
+**Analysis:** The current offload miss path copies one expert as two tensors,
+so per-expert overhead is still visible (0.31 ms no-pin, 0.26 ms pin). Packing
+multiple experts into one contiguous transfer amortizes that overhead: no-pin
+falls from 1.1243 ms/expert to 0.4807 ms/expert at 16 experts (2.34x), and pin
+falls from 0.7795 ms/expert to 0.4197 ms/expert (1.86x). CPU pinned source
+memory improves the small-copy path most strongly (30.7% total-time reduction
+for the current path, 52.8% for 2-expert batch), but after 4–16 experts the
+transfer is mostly bandwidth-bound and the remaining gain is about 10–13%.
+The no-pin small-batch path also has clear long tails, while 4/8/16-expert
+contiguous batches are stable; the offload design should therefore prioritize
+batched contiguous expert movement before treating pinning as the primary knob.
+
 > Note on wait/MTE ratios: the per-run report also lists a cumulative kernel
 > wait ratio (911.7% mixed) and an MTE time ratio (90.8% mixed). These are summed
 > across kernels and streams and can exceed 100%, so treat them as relative
