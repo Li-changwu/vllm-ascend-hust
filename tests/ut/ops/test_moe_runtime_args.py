@@ -121,6 +121,28 @@ class TestMoERuntimeArgs(unittest.TestCase):
         self.assertIsNone(fused_experts_input.routing.log2phy)
         self.assertIsNone(fused_experts_input.routing.physical_expert_count)
 
+    def test_build_fused_experts_input_keeps_profile_only_offload_metadata(self):
+        fused_experts_input = build_fused_experts_input(
+            hidden_states=torch.randn(2, 8),
+            topk_weights=torch.randn(2, 2),
+            topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
+            w1=torch.randn(4, 8, 16),
+            w2=torch.randn(4, 16, 8),
+            quant_type=QuantType.NONE,
+            dynamic_eplb=False,
+            offload_enabled=False,
+            offload_profile_only=True,
+            offload_layer_id=11,
+            offload_step_id=42,
+        )
+
+        self.assertIsNotNone(fused_experts_input.offload)
+        assert fused_experts_input.offload is not None
+        self.assertFalse(fused_experts_input.offload.enabled)
+        self.assertTrue(fused_experts_input.offload.profile_only)
+        self.assertEqual(fused_experts_input.offload.layer_id, 11)
+        self.assertEqual(fused_experts_input.offload.step_id, 42)
+
     def test_build_fused_experts_input_merges_dense_and_quant_weights(self):
         w1 = torch.randn(2, 8, 16)
         w2 = torch.randn(2, 16, 8)

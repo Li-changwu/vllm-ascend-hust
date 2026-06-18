@@ -273,7 +273,7 @@ def _summarize_pipeline_profile(profile_path: Path | None) -> dict[str, Any]:
     all_records = _read_jsonl(profile_path)
     records = [
         record for record in all_records
-        if record.get("event", "moe_pipeline_timing") == "moe_pipeline_timing"
+        if record.get("event") == "moe_pipeline_timing"
     ]
     if not records:
         summary = {
@@ -316,7 +316,61 @@ def _summarize_pipeline_profile(profile_path: Path | None) -> dict[str, Any]:
     gate_summary = _summarize_compute_bucket_gate_events(all_records)
     if gate_summary:
         summary["compute_bucket_fast_path_gate"] = gate_summary
+    offload_timeline_summary = _summarize_offload_timeline_events(all_records)
+    if offload_timeline_summary:
+        summary["offload_timeline"] = offload_timeline_summary
     return summary
+
+
+def _summarize_offload_timeline_events(records: list[dict[str, Any]]) -> dict[str, Any]:
+    timeline_records = [
+        record for record in records
+        if record.get("event") == "moe_offload_timeline"
+    ]
+    if not timeline_records:
+        return {}
+
+    by_name: dict[str, list[float]] = defaultdict(list)
+    cache_hits = 0
+    cache_misses = 0
+    h2d_bytes = 0
+    for record in timeline_records:
+        name = str(record.get("name") or "unknown")
+        duration_us = _float(record.get("duration_us"))
+        if duration_us <= 0 and _float(record.get("seconds")) > 0:
+            duration_us = _float(record.get("seconds")) * 1_000_000
+        by_name[name].append(duration_us / 1000.0)
+        payload = record.get("payload") or {}
+        if name == "slot_cache_lookup":
+            if bool(payload.get("cache_hit")):
+                cache_hits += 1
+            else:
+                cache_misses += 1
+        if name == "expert_h2d_load_sync":
+            h2d_bytes += _int(payload.get("bytes"))
+
+    stage_rows = []
+    for name, values_ms in by_name.items():
+        total_ms = sum(values_ms)
+        stage_rows.append({
+            "name": name,
+            "count": len(values_ms),
+            "total_ms": round(total_ms, 4),
+            "mean_ms": round(total_ms / len(values_ms), 4) if values_ms else 0.0,
+            "max_ms": round(max(values_ms), 4) if values_ms else 0.0,
+        })
+    stage_rows.sort(key=lambda item: item["total_ms"], reverse=True)
+    lookup_total = cache_hits + cache_misses
+    return {
+        "record_count": len(timeline_records),
+        "stages": stage_rows,
+        "cache": {
+            "hits": cache_hits,
+            "misses": cache_misses,
+            "hit_rate": round(cache_hits / lookup_total, 4) if lookup_total else 0.0,
+        },
+        "h2d_bytes": h2d_bytes,
+    }
 
 
 def _summarize_compute_bucket_gate_events(records: list[dict[str, Any]]) -> dict[str, Any]:

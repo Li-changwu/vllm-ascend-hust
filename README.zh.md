@@ -99,7 +99,21 @@ MoeTokenUnpermute、Slice —— 路由相关算子在 mixed 窗口合计约 197
 链，具备合并条件。这条占比约 20% 的轨道虽非最大头，但 kernel 数量极多，launch
 与 stream 调度开销不可忽视，是 TPOT 优化的次级目标。
 
-**结论三 —— 专家卸载搬运主要由 host-to-device memcpy 主导；连续 batch 搬运是主要
+> 关于 wait / MTE 比率的说明：单次运行报告还会给出累计 kernel wait 比率（mixed
+> 为 911.7%）和 MTE 时间比率（mixed 为 90.8%）。这两个值是跨 kernel 与跨 stream
+> 累加的，会超过 100%，因此应当把它们当作**相对的 stream 压力信号**，而不是绝对
+> 的 stall 时间。
+
+复现方式与逐阶段报告见 [benchmarks/README.md](benchmarks/README.md)；每次运行的
+报告会落在 `benchmarks/results/<run>/ascend_moe_profile_report.md`（results 目录
+不纳入版本控制）。
+
+## P0 搬运剖析结论：MoE 卸载的搬运时间花在哪里
+
+本节把专家搬运从上面的算子级推理剖析中拆出来，单独总结 Qwen3-30B-A3B 专家卸载的
+expert copy micro-profile 与 service 级 slot bank 实验。
+
+**结论一 —— 专家卸载搬运主要由 host-to-device memcpy 主导；连续 batch 搬运是主要
 优化杠杆，CPU pinned 源内存主要改善小 batch 的稳定性。** 基于 Qwen3-30B-A3B 的
 专家搬运 micro-profile，每个 pattern 采集 100 个独立 CANN profiler 窗口。单个
 expert payload 为 9.0 MiB（bf16）。下表中的 `pin` 仅表示 PyTorch CPU
@@ -126,14 +140,31 @@ batch 的 0.4807 ms/expert（2.34x），pin 从 0.7795 ms/expert 降到
 expert 连续 batch 的波动很小，因此专家卸载设计应优先做连续 batch 搬运，再把
 pinning 作为辅助优化旋钮。
 
-> 关于 wait / MTE 比率的说明：单次运行报告还会给出累计 kernel wait 比率（mixed
-> 为 911.7%）和 MTE 时间比率（mixed 为 90.8%）。这两个值是跨 kernel 与跨 stream
-> 累加的，会超过 100%，因此应当把它们当作**相对的 stream 压力信号**，而不是绝对
-> 的 stall 时间。
+**结论二 —— 将常驻 slot bank 从 8 扩到 32，可以显著降低 service 级搬运压力，并
+消除 L23 之后的同步 copy 长尾。** 使用同一个 Qwen3-30B-A3B ShareGPT 请求重新跑
+service profile，生成 64 tokens，14 GB offload budget，仍走 eager offload 路径，
+只把 `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` 从 8 改到 32。slot=32 这次运行使用 NPU 7，
+因为原 NPU 5 启动时空闲 HBM 不足，所以这是方向性的 A/B 结果，不是严格同卡对照。
 
-复现方式与逐阶段报告见 [benchmarks/README.md](benchmarks/README.md)；每次运行的
-报告会落在 `benchmarks/results/<run>/ascend_moe_profile_report.md`（results 目录
-不纳入版本控制）。
+| 指标 | 8 slots | 32 slots | 变化 |
+|---|---:|---:|---:|
+| 总 cache hit rate | 39.29% | 84.47% | +45.18 pp |
+| 总 cache misses | 3730 | 954 | -74.4% |
+| 总 H2D payload | 35.20 GB | 9.00 GB | -74.4% |
+| 总 `expert_h2d_load_sync` 时间 | 19.68 s | 2.29 s | -88.3% |
+| 总 pipeline 时间 | 33.84 s | 14.82 s | -56.2% |
+| Wave2 misses / payload | 89 / 801 MiB | 89 / 801 MiB | 不变 |
+| Wave2 H2D 时间 | 1372.1 ms | 241.4 ms | -82.4% |
+| Wave64 misses / payload | 70 / 630 MiB | 16 / 144 MiB | misses -77.1% |
+| Wave64 H2D 时间 | 244.7 ms | 28.1 ms | -88.5% |
+
+**分析：** 第二个 decode wave 的 miss 数没有变化，因为这波 active expert set 对两种
+slot 数来说都基本还是 cold set。关键变化在于：相同的 Wave2 miss 体量不再造成 L23
+之后的长尾，L23 从 144.3 ms 降到 26.3 ms，L27 从 213.9 ms 降到 24.7 ms，L35 从
+218.2 ms 降到 18.6 ms，L47 从 183.2 ms 降到 24.9 ms。这说明慢的
+`expert_h2d_load_sync` 并不能只用 miss 数解释；运行时排队、同步等待和 host-memory
+搬运压力主导了那个窗口。到最后一个 wave，更多 hot experts 能够常驻，miss 从 70
+降到 16。代价是 HBM：32 slots 的 slot bank 约占 22.55 GB，启动时需要足够空闲显存。
 
 ## 准备
 

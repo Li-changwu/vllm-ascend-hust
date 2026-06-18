@@ -31,6 +31,7 @@ from vllm.distributed.parallel_state import get_ep_group
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.moe_offload.pipeline import get_moe_pipeline_profiler
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -373,6 +374,10 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             global_num_experts = int(token_dispatch_input.routing.physical_expert_count)
             first_expert_idx = 0
             last_expert_idx = global_num_experts
+        pipeline_profiler = get_moe_pipeline_profiler()
+        do_detail_profile = pipeline_profiler.enabled
+        if do_detail_profile:
+            init_routing_start = pipeline_profiler.record()
         sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,
@@ -384,7 +389,33 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             active_expert_range=[first_expert_idx, last_expert_idx],
             quant_mode=1 if with_quant and pertoken_scale is None else -1,
         )
+        if do_detail_profile:
+            init_routing_end = pipeline_profiler.record()
+            pipeline_profiler.add_detail_event(
+                "r_init_routing",
+                start=init_routing_start,
+                end=init_routing_end,
+                payload={
+                    "num_tokens": int(num_tokens),
+                    "top_k": int(self.top_k),
+                    "expert_num": int(global_num_experts),
+                    "first_expert_idx": int(first_expert_idx),
+                    "last_expert_idx": int(last_expert_idx),
+                    "with_quant": bool(with_quant),
+                },
+            )
+            cast_start = pipeline_profiler.record()
         expert_tokens = expert_tokens.to(torch.int64)
+        if do_detail_profile:
+            cast_end = pipeline_profiler.record()
+            pipeline_profiler.add_detail_event(
+                "r_expert_tokens_cast",
+                start=cast_start,
+                end=cast_end,
+                payload={
+                    "expert_tokens_shape": list(expert_tokens.shape),
+                },
+            )
         group_list_type = 1  # `count` mode
 
         return MoETokenDispatchOutput(

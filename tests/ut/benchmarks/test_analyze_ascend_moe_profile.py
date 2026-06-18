@@ -161,6 +161,38 @@ def append_compute_bucket_gate_profile(output: Path) -> None:
             }) + "\n")
 
 
+def append_offload_timeline_profile(output: Path) -> None:
+    profile_path = output.parent / "sew_moe_profile.jsonl"
+    with profile_path.open("a", encoding="utf-8") as f:
+        for record in (
+            {
+                "event": "moe_offload_timeline",
+                "name": "slot_cache_lookup",
+                "layer_id": 1,
+                "step_id": 3,
+                "duration_us": 4.0,
+                "payload": {"expert_id": 1, "cache_hit": True},
+            },
+            {
+                "event": "moe_offload_timeline",
+                "name": "slot_cache_lookup",
+                "layer_id": 1,
+                "step_id": 3,
+                "duration_us": 5.0,
+                "payload": {"expert_id": 2, "cache_hit": False},
+            },
+            {
+                "event": "moe_offload_timeline",
+                "name": "expert_h2d_load_sync",
+                "layer_id": 1,
+                "step_id": 3,
+                "duration_us": 200.0,
+                "payload": {"expert_id": 2, "slot_id": 0, "bytes": 8192},
+            },
+        ):
+            f.write(json.dumps(record) + "\n")
+
+
 def test_builds_phase_report_with_moe_and_fusion_recommendations(tmp_path):
     analyzer = load_analyzer_module()
     output = make_profile_dir(tmp_path, "decode")
@@ -382,6 +414,22 @@ def test_analyzer_summarizes_compute_bucket_fast_path_gate_events(tmp_path):
     }
     assert "Compute bucket gate: enabled=50.0%" in markdown
     assert "experts 4.0 -> 3.0" in markdown
+
+
+def test_analyzer_summarizes_offload_timeline_events(tmp_path):
+    analyzer = load_analyzer_module()
+    output = make_profile_dir(tmp_path, "decode")
+    write_pipeline_profile(output, stage_t_ms=0.1, stage_r_ms=0.5, stage_c_ms=6.0, stage_m_ms=0.4)
+    append_offload_timeline_profile(output)
+
+    report = analyzer.analyze_profile("decode", output, None)
+
+    timeline = report["pipeline_profile"]["offload_timeline"]
+    assert timeline["record_count"] == 3
+    assert timeline["cache"] == {"hits": 1, "misses": 1, "hit_rate": 0.5}
+    assert timeline["h2d_bytes"] == 8192
+    assert timeline["stages"][0]["name"] == "expert_h2d_load_sync"
+    assert timeline["stages"][0]["total_ms"] == 0.2
 
 
 def test_analyzer_recommends_p1_rm_when_routing_is_large_and_shapes_unstable(tmp_path):

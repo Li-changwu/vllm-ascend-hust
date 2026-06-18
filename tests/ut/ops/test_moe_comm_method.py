@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -304,6 +305,7 @@ class TestMoECommMethod(TestBase):
             physical_expert_count=2,
         )
         runtime = MagicMock()
+        runtime.config = SimpleNamespace(phase_split_enabled=False)
         runtime.should_use_layered_runtime = False
         runtime.prepare_fixed_slot_plan.return_value = prepared
         runtime.should_use_fixed_slot_plan_for_layer.return_value = True
@@ -339,6 +341,7 @@ class TestMoECommMethod(TestBase):
 
         runtime.prepare_fixed_slot_plan.assert_called_once_with(
             layer_id=6,
+            step_id=0,
             active_experts=(1, 2),
             num_logical_experts=3,
             device=topk_ids.device,
@@ -378,6 +381,7 @@ class TestMoECommMethod(TestBase):
         original_w1 = torch.randn(3, 2, 4)
         original_w2 = torch.randn(3, 4, 2)
         runtime = MagicMock()
+        runtime.config = SimpleNamespace(phase_split_enabled=False)
         runtime.should_use_layered_runtime = True
         runtime.decide_layered_path.return_value = MagicMock(path=MoeOffloadDecisionPath.FULL_WEIGHT_PATH)
 
@@ -426,6 +430,7 @@ class TestMoECommMethod(TestBase):
         mock_token_dispatcher.return_value = mock_td_instance
         comm_impl = AllGatherCommImpl(self.moe_config)
         runtime = MagicMock()
+        runtime.config = SimpleNamespace(phase_split_enabled=False)
         runtime.should_use_layered_runtime = True
         runtime.decide_layered_path.return_value = MagicMock(
             path=MoeOffloadDecisionPath.FAIL_CLOSED,

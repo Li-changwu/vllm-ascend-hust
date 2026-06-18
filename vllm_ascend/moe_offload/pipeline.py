@@ -25,6 +25,8 @@ Stage C (compute), and Stage M (combine) elapsed times using
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -94,6 +96,57 @@ class MoePipelineTiming:
         }
 
 
+@dataclass(frozen=True)
+class MoePipelineDetailTiming:
+    layer_id: int
+    step_id: int
+    name: str
+    duration_ms: float
+    source: str = "npu_event"
+    payload: dict[str, object] | None = None
+
+    def to_jsonable(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "layer_id": self.layer_id,
+            "step_id": self.step_id,
+            "name": self.name,
+            "duration_ms": round(self.duration_ms, 4),
+            "source": self.source,
+        }
+        if self.payload:
+            data["payload"] = self.payload
+        return data
+
+
+@dataclass
+class _MoePipelineDetailEvent:
+    name: str
+    start: "torch.npu.Event"
+    end: "torch.npu.Event"
+    payload: dict[str, object] | None = None
+
+
+@dataclass
+class _MoePipelineWallDetailEvent:
+    name: str
+    duration_ms: float
+    payload: dict[str, object] | None = None
+
+
+@dataclass
+class _MoePipelineDetailContext:
+    layer_id: int
+    step_id: int
+    events: list[_MoePipelineDetailEvent]
+    wall_events: list[_MoePipelineWallDetailEvent]
+
+
+_detail_context: ContextVar[_MoePipelineDetailContext | None] = ContextVar(
+    "moe_pipeline_detail_context",
+    default=None,
+)
+
+
 class MoePipelineProfiler:
     """Collect npu.Event-based stage timing for the MoE fused_experts pipeline.
 
@@ -115,6 +168,7 @@ class MoePipelineProfiler:
 
     def __init__(self) -> None:
         self._timings: list[MoePipelineTiming] = []
+        self._detail_timings: list[MoePipelineDetailTiming] = []
 
     @property
     def enabled(self) -> bool:
@@ -126,6 +180,93 @@ class MoePipelineProfiler:
         event = torch.npu.Event(enable_timing=True)
         torch.npu.current_stream().record_event(event)
         return event
+
+    @contextmanager
+    def detail_context(self, *, layer_id: int, step_id: int):
+        ctx = _MoePipelineDetailContext(
+            layer_id=int(layer_id),
+            step_id=int(step_id),
+            events=[],
+            wall_events=[],
+        )
+        token = _detail_context.set(ctx)
+        try:
+            yield ctx
+        finally:
+            _detail_context.reset(token)
+
+    def add_detail_event(
+        self,
+        name: str,
+        *,
+        start: "torch.npu.Event",
+        end: "torch.npu.Event",
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        ctx = _detail_context.get()
+        if ctx is None:
+            return
+        ctx.events.append(
+            _MoePipelineDetailEvent(
+                name=str(name),
+                start=start,
+                end=end,
+                payload=payload,
+            )
+        )
+
+    def add_wall_detail_timing(
+        self,
+        name: str,
+        *,
+        duration_ms: float,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        ctx = _detail_context.get()
+        if ctx is None:
+            return
+        ctx.wall_events.append(
+            _MoePipelineWallDetailEvent(
+                name=str(name),
+                duration_ms=float(duration_ms),
+                payload=payload,
+            )
+        )
+
+    def commit_detail_context(self, ctx: _MoePipelineDetailContext | None) -> list[MoePipelineDetailTiming]:
+        if not self.enabled or ctx is None:
+            return []
+
+        timings: list[MoePipelineDetailTiming] = []
+        for event in ctx.events:
+            duration_ms = self._elapsed_ms(event.start, event.end)
+            timing = MoePipelineDetailTiming(
+                layer_id=ctx.layer_id,
+                step_id=ctx.step_id,
+                name=event.name,
+                duration_ms=duration_ms,
+                payload=event.payload,
+            )
+            timings.append(timing)
+            self._detail_timings.append(timing)
+            self._write_detail_jsonl(timing)
+        for event in ctx.wall_events:
+            timing = MoePipelineDetailTiming(
+                layer_id=ctx.layer_id,
+                step_id=ctx.step_id,
+                name=event.name,
+                duration_ms=event.duration_ms,
+                source="cpu_wall",
+                payload=event.payload,
+            )
+            timings.append(timing)
+            self._detail_timings.append(timing)
+            self._write_detail_jsonl(timing)
+        return timings
 
     def commit(
         self,
@@ -145,19 +286,13 @@ class MoePipelineProfiler:
 
         e0, e1, e2, e3, e4 = events
 
-        def _elapsed_ms(start: "torch.npu.Event", end: "torch.npu.Event") -> float:
-            try:
-                return float(start.elapsed_time(end))
-            except Exception:
-                return -1.0
-
         timing = MoePipelineTiming(
             layer_id=int(layer_id),
             step_id=int(step_id),
-            stage_t_ms=_elapsed_ms(e0, e1),
-            stage_r_ms=_elapsed_ms(e1, e2),
-            stage_c_ms=_elapsed_ms(e2, e3),
-            stage_m_ms=_elapsed_ms(e3, e4),
+            stage_t_ms=self._elapsed_ms(e0, e1),
+            stage_r_ms=self._elapsed_ms(e1, e2),
+            stage_c_ms=self._elapsed_ms(e2, e3),
+            stage_m_ms=self._elapsed_ms(e3, e4),
         )
         self._timings.append(timing)
         self._write_jsonl(timing)
@@ -211,7 +346,15 @@ class MoePipelineProfiler:
                     else "transfer_dominated"
                 ),
             },
+            "detail_count": len(self._detail_timings),
         }
+
+    @staticmethod
+    def _elapsed_ms(start: "torch.npu.Event", end: "torch.npu.Event") -> float:
+        try:
+            return float(start.elapsed_time(end))
+        except Exception:
+            return -1.0
 
     @staticmethod
     def _write_jsonl(timing: MoePipelineTiming) -> None:
@@ -221,6 +364,17 @@ class MoePipelineProfiler:
         path = Path(profile_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"event": "moe_pipeline_timing", **timing.to_jsonable()}
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+    @staticmethod
+    def _write_detail_jsonl(timing: MoePipelineDetailTiming) -> None:
+        profile_path = envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
+        if not profile_path:
+            return
+        path = Path(profile_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"event": "moe_pipeline_detail_timing", **timing.to_jsonable()}
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, sort_keys=True) + "\n")
 

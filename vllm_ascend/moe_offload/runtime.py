@@ -20,7 +20,7 @@ from enum import Enum
 from itertools import count
 import json
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, perf_counter_ns
 
 import torch
 
@@ -111,10 +111,44 @@ class MoeOffloadProfileEvent:
 
     def to_jsonable(self) -> dict[str, object]:
         data = {
+            "event": "moe_offload_profile",
             "name": self.name,
             "layer_id": self.layer_id,
             "seconds": self.seconds,
             "memory_ledger": self.memory_ledger.to_jsonable(),
+        }
+        if self.payload is not None:
+            data["payload"] = self.payload
+        return data
+
+
+@dataclass(frozen=True)
+class MoeOffloadTimelineEvent:
+    name: str
+    layer_id: int | None
+    step_id: int
+    start_ns: int
+    end_ns: int
+    payload: dict[str, object] | None = None
+
+    @property
+    def duration_ns(self) -> int:
+        return max(0, int(self.end_ns) - int(self.start_ns))
+
+    @property
+    def seconds(self) -> float:
+        return self.duration_ns / 1_000_000_000
+
+    def to_jsonable(self) -> dict[str, object]:
+        data = {
+            "event": "moe_offload_timeline",
+            "name": self.name,
+            "layer_id": self.layer_id,
+            "step_id": int(self.step_id),
+            "start_ns": int(self.start_ns),
+            "end_ns": int(self.end_ns),
+            "duration_us": round(self.duration_ns / 1_000, 3),
+            "seconds": round(self.seconds, 9),
         }
         if self.payload is not None:
             data["payload"] = self.payload
@@ -133,6 +167,9 @@ class MoeOffloadRuntime:
         self._transfer_engine = TransferEngine()
         self._profile_events: list[MoeOffloadProfileEvent] = []
 
+    def next_step_id(self) -> int:
+        return int(next(self._step_counter))
+
     def trace_routing(
         self,
         *,
@@ -141,11 +178,12 @@ class MoeOffloadRuntime:
         topk_weights: torch.Tensor,
         num_experts: int,
         mode: str = "unknown",
+        step_id: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.config.should_trace:
             record = self.trace_collector.record(
                 layer_id=layer_id,
-                step_id=next(self._step_counter),
+                step_id=self.next_step_id() if step_id is None else int(step_id),
                 topk_ids=topk_ids,
                 num_experts=num_experts,
                 mode=mode,
@@ -236,6 +274,7 @@ class MoeOffloadRuntime:
         *,
         layer_id: int,
         active_experts: tuple[int, ...],
+        step_id: int | None = None,
     ) -> MoeOffloadPathDecision:
         normalized_layer_id = int(layer_id)
         unique_active_experts = _dedupe_preserve_order(active_experts)
@@ -276,7 +315,10 @@ class MoeOffloadRuntime:
             "layered_path_decision",
             layer_id=normalized_layer_id,
             start=perf_counter(),
-            payload=decision.to_jsonable(),
+            payload={
+                "step_id": self.next_step_id() if step_id is None else int(step_id),
+                **decision.to_jsonable(),
+            },
         )
         return decision
 
@@ -373,6 +415,7 @@ class MoeOffloadRuntime:
         self,
         *,
         layer_id: int,
+        step_id: int | None = None,
         active_experts: tuple[int, ...],
         num_logical_experts: int,
         device: torch.device,
@@ -381,16 +424,75 @@ class MoeOffloadRuntime:
             raise RuntimeError("fixed-slot plan requested while moe offload fixed slots are disabled")
 
         layer_id = int(layer_id)
+        plan_step_id = self.next_step_id() if step_id is None else int(step_id)
+        timeline_enabled = self._timeline_enabled()
+        plan_start_ns = perf_counter_ns() if timeline_enabled else 0
+        plan_payload: dict[str, object] = {
+            "status": "ok",
+            "active_expert_count": len(active_experts),
+            "num_logical_experts": int(num_logical_experts),
+        }
+        prepared_weights: PreparedSlotWeights | None = None
+        try:
+            prepared_weights = self._prepare_fixed_slot_plan_impl(
+                layer_id=layer_id,
+                step_id=plan_step_id,
+                active_experts=active_experts,
+                num_logical_experts=num_logical_experts,
+                device=device,
+                timeline_enabled=timeline_enabled,
+            )
+            plan_payload["physical_expert_count"] = prepared_weights.physical_expert_count
+            plan_payload["active_slot_ids"] = list(prepared_weights.mapping.active_slot_ids)
+            return prepared_weights
+        except Exception as exc:
+            plan_payload["status"] = "error"
+            plan_payload["error"] = str(exc)
+            raise
+        finally:
+            if timeline_enabled:
+                self._record_timeline_event(
+                    "prepare_fixed_slot_plan",
+                    layer_id=layer_id,
+                    step_id=plan_step_id,
+                    start_ns=plan_start_ns,
+                    end_ns=perf_counter_ns(),
+                    payload=plan_payload,
+                )
+
+    def _prepare_fixed_slot_plan_impl(
+        self,
+        *,
+        layer_id: int,
+        step_id: int,
+        active_experts: tuple[int, ...],
+        num_logical_experts: int,
+        device: torch.device,
+        timeline_enabled: bool,
+    ) -> PreparedSlotWeights:
         if self.is_resident_layer(layer_id):
             raise RuntimeError(
                 f"fixed-slot plan must not run on resident layer {layer_id}; use original NPU expert weights"
             )
+        normalize_start_ns = perf_counter_ns() if timeline_enabled else 0
         unique_active_experts = _dedupe_preserve_order(active_experts)
         _validate_active_expert_ids(
             layer_id=layer_id,
             active_experts=unique_active_experts,
             num_logical_experts=num_logical_experts,
         )
+        if timeline_enabled:
+            self._record_timeline_event(
+                "active_expert_normalize",
+                layer_id=layer_id,
+                step_id=step_id,
+                start_ns=normalize_start_ns,
+                end_ns=perf_counter_ns(),
+                payload={
+                    "active_expert_count": len(unique_active_experts),
+                    "active_experts": list(unique_active_experts),
+                },
+            )
         if len(unique_active_experts) > self.config.num_slots:
             raise RuntimeError(
                 f"active expert working set size {len(unique_active_experts)} exceeds num_slots={self.config.num_slots}"
@@ -400,18 +502,87 @@ class MoeOffloadRuntime:
         if slot_bank is None:
             raise RuntimeError(f"layer {layer_id} is not registered for fixed-slot execution")
 
-        step_id = next(self._step_counter)
         for expert_id in unique_active_experts:
             key = ExpertKey(layer_id, int(expert_id))
+            lookup_start_ns = perf_counter_ns() if timeline_enabled else 0
             slot = slot_bank.lookup(key)
             if slot is not None and slot.state == SlotState.READY:
                 slot.last_used_step = int(step_id)
+                if timeline_enabled:
+                    self._record_timeline_event(
+                        "slot_cache_lookup",
+                        layer_id=layer_id,
+                        step_id=step_id,
+                        start_ns=lookup_start_ns,
+                        end_ns=perf_counter_ns(),
+                        payload={
+                            "expert_id": int(expert_id),
+                            "cache_hit": True,
+                            "slot_id": int(slot.slot_id),
+                        },
+                    )
                 continue
+            if timeline_enabled:
+                self._record_timeline_event(
+                    "slot_cache_lookup",
+                    layer_id=layer_id,
+                    step_id=step_id,
+                    start_ns=lookup_start_ns,
+                    end_ns=perf_counter_ns(),
+                    payload={
+                        "expert_id": int(expert_id),
+                        "cache_hit": False,
+                    },
+                )
 
+            allocate_start_ns = perf_counter_ns() if timeline_enabled else 0
             slot = slot_bank.allocate_for(key, step_id=step_id)
-            bundle = self._host_store.get(layer_id, int(expert_id))
-            self._transfer_engine.load_sync(bundle, slot)
+            if timeline_enabled:
+                self._record_timeline_event(
+                    "slot_allocate",
+                    layer_id=layer_id,
+                    step_id=step_id,
+                    start_ns=allocate_start_ns,
+                    end_ns=perf_counter_ns(),
+                    payload={
+                        "expert_id": int(expert_id),
+                        "slot_id": int(slot.slot_id),
+                        "slot_version": int(slot.version),
+                    },
+                )
 
+            host_lookup_start_ns = perf_counter_ns() if timeline_enabled else 0
+            bundle = self._host_store.get(layer_id, int(expert_id))
+            if timeline_enabled:
+                self._record_timeline_event(
+                    "host_bundle_lookup",
+                    layer_id=layer_id,
+                    step_id=step_id,
+                    start_ns=host_lookup_start_ns,
+                    end_ns=perf_counter_ns(),
+                    payload={
+                        "expert_id": int(expert_id),
+                        "slot_id": int(slot.slot_id),
+                    },
+                )
+
+            transfer_start_ns = perf_counter_ns() if timeline_enabled else 0
+            self._transfer_engine.load_sync(bundle, slot)
+            if timeline_enabled:
+                self._record_timeline_event(
+                    "expert_h2d_load_sync",
+                    layer_id=layer_id,
+                    step_id=step_id,
+                    start_ns=transfer_start_ns,
+                    end_ns=perf_counter_ns(),
+                    payload={
+                        "expert_id": int(expert_id),
+                        "slot_id": int(slot.slot_id),
+                        "bytes": _bundle_nbytes(bundle),
+                    },
+                )
+
+        mapping_start_ns = perf_counter_ns() if timeline_enabled else 0
         mapping = ExpertSlotMapping.from_slot_bank(
             layer_id=layer_id,
             active_experts=unique_active_experts,
@@ -419,7 +590,33 @@ class MoeOffloadRuntime:
             slot_bank=slot_bank,
             device=device,
         )
-        return PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
+        if timeline_enabled:
+            self._record_timeline_event(
+                "slot_mapping_build",
+                layer_id=layer_id,
+                step_id=step_id,
+                start_ns=mapping_start_ns,
+                end_ns=perf_counter_ns(),
+                payload={
+                    "active_slot_ids": list(mapping.active_slot_ids),
+                    "device": str(device),
+                },
+            )
+
+        prepare_view_start_ns = perf_counter_ns() if timeline_enabled else 0
+        prepared_weights = PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
+        if timeline_enabled:
+            self._record_timeline_event(
+                "prepared_slot_weights",
+                layer_id=layer_id,
+                step_id=step_id,
+                start_ns=prepare_view_start_ns,
+                end_ns=perf_counter_ns(),
+                payload={
+                    "physical_expert_count": int(prepared_weights.physical_expert_count),
+                },
+            )
+        return prepared_weights
 
     def prepare_weights_for_execution(
         self,
@@ -454,7 +651,41 @@ class MoeOffloadRuntime:
         self._append_profile_event_jsonl(event)
 
     @staticmethod
+    def _timeline_enabled() -> bool:
+        return bool(envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH)
+
+    def _record_timeline_event(
+        self,
+        name: str,
+        *,
+        layer_id: int | None,
+        step_id: int,
+        start_ns: int,
+        end_ns: int,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        event = MoeOffloadTimelineEvent(
+            name=name,
+            layer_id=layer_id,
+            step_id=step_id,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            payload=payload,
+        )
+        self._append_timeline_event_jsonl(event)
+
+    @staticmethod
     def _append_profile_event_jsonl(event: MoeOffloadProfileEvent) -> None:
+        profile_path = envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
+        if not profile_path:
+            return
+        path = Path(profile_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event.to_jsonable(), sort_keys=True) + "\n")
+
+    @staticmethod
+    def _append_timeline_event_jsonl(event: MoeOffloadTimelineEvent) -> None:
         profile_path = envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
         if not profile_path:
             return
@@ -476,6 +707,15 @@ class MoeOffloadRuntime:
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _bundle_nbytes(bundle) -> int:
+    total = _tensor_nbytes(bundle.w13) + _tensor_nbytes(bundle.w2)
+    if bundle.w13_scale is not None:
+        total += _tensor_nbytes(bundle.w13_scale)
+    if bundle.w2_scale is not None:
+        total += _tensor_nbytes(bundle.w2_scale)
+    return int(total)
 
 
 _runtime: MoeOffloadRuntime | None = None

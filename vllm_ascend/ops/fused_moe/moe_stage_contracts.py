@@ -60,9 +60,11 @@ class MoEOffloadParams:
     """Optional SEW-Offload metadata consumed at the fused_experts boundary."""
 
     enabled: bool = False
+    profile_only: bool = False
     layer_id: int = -1
     num_logical_experts: int = -1
     expected_device_type: str = "npu"
+    step_id: int = -1
 
 
 @dataclass(frozen=True, slots=True)

@@ -280,6 +280,30 @@ The main outputs are:
 - `<phase>/sew_moe_profile.jsonl`: per-window Stage T/R/C/M timing records
 - `<phase>/slot_sweep_lru.json`: optional fixed-slot sweep summary when `--run-slot-sweep` is set
 
+Ascend PyTorch Profiler is still the best source for CANN/runtime/operator
+evidence: after `torch_npu.profiler.profiler.analyse()`, open
+`<phase>/ASCEND_PROFILER_OUTPUT/trace_view.json` in MindStudio Insight,
+Perfetto, or Chrome tracing to inspect NPU kernels, `aclrtMemcpy`, waits, and
+stream ordering. It does not know the SEW-Offload business stages by itself
+(expert cache hit/miss, slot allocation, host bundle lookup, logical-to-physical
+mapping). For an offload-aware timeline, keep
+`VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH` set and render the JSONL produced by the
+server:
+
+```shell
+python3 tools/sew_offload/moe_offload_timeline.py \
+  --profile-jsonl benchmarks/results/qwen3_30b_a3b_nonoffload_ascend_pt/decode/sew_moe_profile.jsonl \
+  --summary-json /tmp/moe_offload_timeline_summary.json \
+  --markdown-output /tmp/moe_offload_timeline.md \
+  --chrome-trace-output /tmp/moe_offload_timeline_trace.json
+```
+
+The markdown file contains a Mermaid timing diagram for the representative MoE
+step, plus stage tables. The Chrome trace contains two lanes: SEW-Offload detail
+events (`slot_cache_lookup`, `expert_h2d_load_sync`, `slot_mapping_build`, etc.)
+and the coarse MoE pipeline (`T` offload plan/load, `R` token dispatch, `C`
+expert MLP, `M` token combine).
+
 To turn the P1 plan into a reproducible benchmark environment matrix:
 
 ```shell

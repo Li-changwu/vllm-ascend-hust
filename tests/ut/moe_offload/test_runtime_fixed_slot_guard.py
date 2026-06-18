@@ -156,6 +156,40 @@ def test_runtime_writes_profile_events_to_jsonl_when_profile_path_is_set(tmp_pat
     assert records[0]["memory_ledger"]["registered_layers"] == 1
 
 
+def test_runtime_writes_fixed_slot_timeline_events_to_profile_jsonl(tmp_path, monkeypatch):
+    profile_path = tmp_path / "moe_profile.jsonl"
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH", str(profile_path))
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, trace_only=False, num_slots=2))
+    layer = _mock_layer(layer_id=4, num_experts=3)
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    prepared = runtime.prepare_fixed_slot_plan(
+        layer_id=4,
+        step_id=17,
+        active_experts=(1, 2),
+        num_logical_experts=3,
+        device=torch.device("cpu"),
+    )
+
+    records = [json.loads(line) for line in profile_path.read_text(encoding="utf-8").splitlines()]
+    timeline_records = [record for record in records if record.get("event") == "moe_offload_timeline"]
+    assert prepared.log2phy.tolist() == [-1, 0, 1]
+    assert [record["name"] for record in timeline_records if record["name"] == "expert_h2d_load_sync"] == [
+        "expert_h2d_load_sync",
+        "expert_h2d_load_sync",
+    ]
+    assert {record["step_id"] for record in timeline_records} == {17}
+    assert any(
+        record["name"] == "slot_cache_lookup" and record["payload"]["cache_hit"] is False
+        for record in timeline_records
+    )
+    assert any(
+        record["name"] == "prepare_fixed_slot_plan"
+        and record["payload"]["active_slot_ids"] == [0, 1]
+        for record in timeline_records
+    )
+
+
 def test_runtime_layered_decision_routes_low_fanout_to_slot_cache_path():
     runtime = MoeOffloadRuntime(
         MoeOffloadConfig(

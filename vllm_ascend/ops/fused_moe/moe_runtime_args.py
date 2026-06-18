@@ -150,6 +150,8 @@ def build_fused_experts_input(
     offload_layer_id: int = -1,
     offload_num_logical_experts: int = -1,
     offload_expected_device_type: str = "npu",
+    offload_step_id: int = -1,
+    offload_profile_only: bool = False,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -181,11 +183,13 @@ def build_fused_experts_input(
         dynamic_eplb=dynamic_eplb,
         offload=MoEOffloadParams(
             enabled=offload_enabled,
+            profile_only=offload_profile_only,
             layer_id=offload_layer_id,
             num_logical_experts=offload_num_logical_experts,
             expected_device_type=offload_expected_device_type,
+            step_id=offload_step_id,
         )
-        if offload_enabled
+        if offload_enabled or offload_profile_only
         else None,
         quant=MoEQuantParams(
             quant_type=quant_type,

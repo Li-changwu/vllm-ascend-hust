@@ -131,7 +131,23 @@ for merging. Although this ~20% track is not the largest share, the kernel count
 is very high, so launch and stream-scheduling overhead cannot be ignored — it is
 the secondary target for TPOT optimization.
 
-**Finding 3 — Expert offload is dominated by host-to-device memcpy; contiguous
+> Note on wait/MTE ratios: the per-run report also lists a cumulative kernel
+> wait ratio (911.7% mixed) and an MTE time ratio (90.8% mixed). These are summed
+> across kernels and streams and can exceed 100%, so treat them as relative
+> stream-pressure signals, not absolute stall time.
+
+Reproduction steps and per-phase reports are in
+[benchmarks/README.md](benchmarks/README.md); each run's report lands under
+`benchmarks/results/<run>/ascend_moe_profile_report.md` (the results directory
+is not version-controlled).
+
+## P0 Transfer Findings: Where MoE Offload Spends Its Transfer Time
+
+This section separates expert movement from the operator-level inference
+profile above. It covers both the expert-copy micro-profile and the
+service-level slot-bank experiment for Qwen3-30B-A3B expert offload.
+
+**Finding 1 — Expert offload is dominated by host-to-device memcpy; contiguous
 batching is the main transfer lever, while CPU pinned source memory mainly
 stabilizes small batches.** A Qwen3-30B-A3B expert transfer micro-profile was
 run with 100 independent CANN profiler windows per pattern. Each expert payload
@@ -161,15 +177,36 @@ The no-pin small-batch path also has clear long tails, while 4/8/16-expert
 contiguous batches are stable; the offload design should therefore prioritize
 batched contiguous expert movement before treating pinning as the primary knob.
 
-> Note on wait/MTE ratios: the per-run report also lists a cumulative kernel
-> wait ratio (911.7% mixed) and an MTE time ratio (90.8% mixed). These are summed
-> across kernels and streams and can exceed 100%, so treat them as relative
-> stream-pressure signals, not absolute stall time.
+**Finding 2 — Expanding the resident slot bank from 8 to 32 reduces service
+transfer pressure and removes the L23+ synchronous-copy tail.** The ShareGPT
+single-request service profile was rerun with the same Qwen3-30B-A3B request,
+64 generated tokens, 14 GB offload budget, and eager offload path, changing
+`VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` from 8 to 32. The slot-32 run used NPU 7
+because the original NPU 5 did not have enough free HBM at startup, so this is a
+directional A/B result rather than a strict same-device comparison.
 
-Reproduction steps and per-phase reports are in
-[benchmarks/README.md](benchmarks/README.md); each run's report lands under
-`benchmarks/results/<run>/ascend_moe_profile_report.md` (the results directory
-is not version-controlled).
+| Metric | 8 slots | 32 slots | Change |
+|---|---:|---:|---:|
+| Overall cache hit rate | 39.29% | 84.47% | +45.18 pp |
+| Overall cache misses | 3730 | 954 | -74.4% |
+| Overall H2D payload | 35.20 GB | 9.00 GB | -74.4% |
+| Overall `expert_h2d_load_sync` time | 19.68 s | 2.29 s | -88.3% |
+| Overall pipeline total | 33.84 s | 14.82 s | -56.2% |
+| Wave2 misses / payload | 89 / 801 MiB | 89 / 801 MiB | unchanged |
+| Wave2 H2D time | 1372.1 ms | 241.4 ms | -82.4% |
+| Wave64 misses / payload | 70 / 630 MiB | 16 / 144 MiB | -77.1% misses |
+| Wave64 H2D time | 244.7 ms | 28.1 ms | -88.5% |
+
+**Analysis:** The second decode wave still has the same number of misses because
+its active expert set is mostly cold for both slot sizes. The important change
+is that identical Wave2 miss volume no longer turns into the L23+ long tail:
+L23 falls from 144.3 ms to 26.3 ms, L27 from 213.9 ms to 24.7 ms, L35 from
+218.2 ms to 18.6 ms, and L47 from 183.2 ms to 24.9 ms. This shows the slow
+`expert_h2d_load_sync` calls were not explained by miss count alone; runtime
+queueing, synchronization, and host-memory transfer pressure dominated that
+window. By the final wave, the larger slot bank also keeps far more hot experts
+resident, cutting misses from 70 to 16. The trade-off is HBM: 32 slots require
+about 22.55 GB for the slot bank, so startup needs enough free device memory.
 
 ## Research Branch MoE Offload Service
 
