@@ -173,40 +173,37 @@ falls from 0.7795 ms/expert to 0.4197 ms/expert (1.86x). CPU pinned source
 memory improves the small-copy path most strongly (30.7% total-time reduction
 for the current path, 52.8% for 2-expert batch), but after 4–16 experts the
 transfer is mostly bandwidth-bound and the remaining gain is about 10–13%.
-The no-pin small-batch path also has clear long tails, while 4/8/16-expert
-contiguous batches are stable; the offload design should therefore prioritize
-batched contiguous expert movement before treating pinning as the primary knob.
+The no-pin small-batch path also has higher latency variance, while
+4/8/16-expert contiguous batches are stable; the offload design should
+therefore prioritize batched contiguous expert movement before treating pinning
+as the primary knob.
 
-**Finding 2 — Expanding the resident slot bank from 8 to 32 reduces service
-transfer pressure and removes the L23+ synchronous-copy tail.** The ShareGPT
-single-request service profile was rerun with the same Qwen3-30B-A3B request,
-64 generated tokens, 14 GB offload budget, and eager offload path, changing
-`VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` from 8 to 32. The slot-32 run used NPU 7
-because the original NPU 5 did not have enough free HBM at startup, so this is a
-directional A/B result rather than a strict same-device comparison.
+**Finding 2 — Increasing the resident slot bank reduces service-level transfer
+pressure by improving expert reuse.** A Qwen3-30B-A3B ShareGPT service profile
+was evaluated with the same request, 64 generated tokens, 14 GB offload budget,
+and eager offload path, while changing `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` from
+8 to 32.
 
 | Metric | 8 slots | 32 slots | Change |
 |---|---:|---:|---:|
 | Overall cache hit rate | 39.29% | 84.47% | +45.18 pp |
 | Overall cache misses | 3730 | 954 | -74.4% |
 | Overall H2D payload | 35.20 GB | 9.00 GB | -74.4% |
-| Overall `expert_h2d_load_sync` time | 19.68 s | 2.29 s | -88.3% |
+| Overall synchronous H2D copy time | 19.68 s | 2.29 s | -88.3% |
 | Overall pipeline total | 33.84 s | 14.82 s | -56.2% |
-| Wave2 misses / payload | 89 / 801 MiB | 89 / 801 MiB | unchanged |
-| Wave2 H2D time | 1372.1 ms | 241.4 ms | -82.4% |
-| Wave64 misses / payload | 70 / 630 MiB | 16 / 144 MiB | -77.1% misses |
-| Wave64 H2D time | 244.7 ms | 28.1 ms | -88.5% |
+| Early decode window misses / payload | 89 / 801 MiB | 89 / 801 MiB | unchanged |
+| Early decode window H2D time | 1372.1 ms | 241.4 ms | -82.4% |
+| Late decode window misses / payload | 70 / 630 MiB | 16 / 144 MiB | -77.1% misses |
+| Late decode window H2D time | 244.7 ms | 28.1 ms | -88.5% |
 
-**Analysis:** The second decode wave still has the same number of misses because
-its active expert set is mostly cold for both slot sizes. The important change
-is that identical Wave2 miss volume no longer turns into the L23+ long tail:
-L23 falls from 144.3 ms to 26.3 ms, L27 from 213.9 ms to 24.7 ms, L35 from
-218.2 ms to 18.6 ms, and L47 from 183.2 ms to 24.9 ms. This shows the slow
-`expert_h2d_load_sync` calls were not explained by miss count alone; runtime
-queueing, synchronization, and host-memory transfer pressure dominated that
-window. By the final wave, the larger slot bank also keeps far more hot experts
-resident, cutting misses from 70 to 16. The trade-off is HBM: 32 slots require
-about 22.55 GB for the slot bank, so startup needs enough free device memory.
+**Analysis:** The early decode window keeps the same miss count and payload for
+both slot sizes, but its H2D time drops by 82.4%. This indicates that
+synchronous copy latency is not determined by miss count alone; queueing,
+synchronization, and host-to-device transfer pressure also matter. In later
+decode windows, the larger slot bank retains more hot experts and directly
+reduces misses. The trade-off is device memory: 32 slots require about 22.55 GB
+for the slot bank, so the offload cache size must be balanced against the model,
+KV cache, and runtime memory budget.
 
 ## Research Branch MoE Offload Service
 

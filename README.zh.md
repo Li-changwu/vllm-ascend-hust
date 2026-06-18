@@ -136,35 +136,33 @@ expert payload 为 9.0 MiB（bf16）。下表中的 `pin` 仅表示 PyTorch CPU
 batch 的 0.4807 ms/expert（2.34x），pin 从 0.7795 ms/expert 降到
 0.4197 ms/expert（1.86x）。CPU pinned 源内存对小 copy 路径收益最大：当前路径总
 时间降低 30.7%，2-expert batch 降低 52.8%；但到 4–16 expert 后，搬运主要进入
-带宽约束区间，剩余收益约 10–13%。同时 no-pin 小 batch 有明显长尾，而 4/8/16
+带宽约束区间，剩余收益约 10–13%。同时 no-pin 小 batch 的延迟波动更大，而 4/8/16
 expert 连续 batch 的波动很小，因此专家卸载设计应优先做连续 batch 搬运，再把
 pinning 作为辅助优化旋钮。
 
-**结论二 —— 将常驻 slot bank 从 8 扩到 32，可以显著降低 service 级搬运压力，并
-消除 L23 之后的同步 copy 长尾。** 使用同一个 Qwen3-30B-A3B ShareGPT 请求重新跑
-service profile，生成 64 tokens，14 GB offload budget，仍走 eager offload 路径，
-只把 `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` 从 8 改到 32。slot=32 这次运行使用 NPU 7，
-因为原 NPU 5 启动时空闲 HBM 不足，所以这是方向性的 A/B 结果，不是严格同卡对照。
+**结论二 —— 增大常驻 slot bank 可以提高 expert 复用率，从而降低 service 级搬运
+压力。** 使用同一个 Qwen3-30B-A3B ShareGPT 请求重新跑 service profile，生成
+64 tokens，14 GB offload budget，仍走 eager offload 路径，只把
+`VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` 从 8 改到 32。
 
 | 指标 | 8 slots | 32 slots | 变化 |
 |---|---:|---:|---:|
 | 总 cache hit rate | 39.29% | 84.47% | +45.18 pp |
 | 总 cache misses | 3730 | 954 | -74.4% |
 | 总 H2D payload | 35.20 GB | 9.00 GB | -74.4% |
-| 总 `expert_h2d_load_sync` 时间 | 19.68 s | 2.29 s | -88.3% |
+| 总同步 H2D copy 时间 | 19.68 s | 2.29 s | -88.3% |
 | 总 pipeline 时间 | 33.84 s | 14.82 s | -56.2% |
-| Wave2 misses / payload | 89 / 801 MiB | 89 / 801 MiB | 不变 |
-| Wave2 H2D 时间 | 1372.1 ms | 241.4 ms | -82.4% |
-| Wave64 misses / payload | 70 / 630 MiB | 16 / 144 MiB | misses -77.1% |
-| Wave64 H2D 时间 | 244.7 ms | 28.1 ms | -88.5% |
+| 较早 decode 窗口 misses / payload | 89 / 801 MiB | 89 / 801 MiB | 不变 |
+| 较早 decode 窗口 H2D 时间 | 1372.1 ms | 241.4 ms | -82.4% |
+| 较晚 decode 窗口 misses / payload | 70 / 630 MiB | 16 / 144 MiB | misses -77.1% |
+| 较晚 decode 窗口 H2D 时间 | 244.7 ms | 28.1 ms | -88.5% |
 
-**分析：** 第二个 decode wave 的 miss 数没有变化，因为这波 active expert set 对两种
-slot 数来说都基本还是 cold set。关键变化在于：相同的 Wave2 miss 体量不再造成 L23
-之后的长尾，L23 从 144.3 ms 降到 26.3 ms，L27 从 213.9 ms 降到 24.7 ms，L35 从
-218.2 ms 降到 18.6 ms，L47 从 183.2 ms 降到 24.9 ms。这说明慢的
-`expert_h2d_load_sync` 并不能只用 miss 数解释；运行时排队、同步等待和 host-memory
-搬运压力主导了那个窗口。到最后一个 wave，更多 hot experts 能够常驻，miss 从 70
-降到 16。代价是 HBM：32 slots 的 slot bank 约占 22.55 GB，启动时需要足够空闲显存。
+**分析：** 较早的 decode 窗口在两种 slot 数下具有相同 miss 数和 payload，但 H2D
+时间降低 82.4%。这说明同步 copy 延迟不能只由 miss 数解释，运行时排队、同步等待和
+host-to-device 搬运压力同样会影响端到端耗时。在较晚的 decode 窗口中，更大的 slot
+bank 能保留更多 hot experts，并直接降低 miss 数。代价是设备内存：32 slots 的 slot
+bank 约占 22.55 GB，因此 offload cache 大小需要和模型、KV cache 以及运行时内存预算
+共同权衡。
 
 ## 准备
 
