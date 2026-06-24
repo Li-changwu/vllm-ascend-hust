@@ -241,6 +241,27 @@ decision path used by the offload scheduler.
 
 Tested with 100 ShareGPT prompts against a running vLLM OpenAI-compatible server.
 
+### MoE ACLgraph
+
+**Configuration:**
+- Model: `Qwen/Qwen3-30B-A3B`
+- Benchmark: [ShareGPT_Benchmark](benchmarks/scripts/bench_sharegpt.py)
+- Backend: Ascend NPU (1 device), `bfloat16`
+- `--max-model-len 512`, `--max-num-seqs 1`, `--max-num-batched-tokens 512`
+- `--kv-cache-memory-bytes 536870912`, `--ascend-moe-offload-gb 14`, `--enforce-eager`
+
+**Results (100 requests, concurrency=1, max_tokens=20):**
+
+| Metric | mean | p50 | p90 |
+|--------|------|-----|-----|
+| TTFT (ms) | 203.7 | 202.7 | 206.9  |
+| TPOT (ms/tok) | 33.27  | 	33.15 | —— |
+| E2EL (s) | 0.91 | —— | —— |
+
+**Throughput:** 22.0 output tokens/s (serial, concurrency=1)
+
+### MoE offload-gb 14
+
 **Configuration:**
 - Model: `Qwen/Qwen3-30B-A3B`
 - Benchmark: [ShareGPT_Benchmark](benchmarks/scripts/bench_sharegpt.py)
@@ -254,7 +275,7 @@ Tested with 100 ShareGPT prompts against a running vLLM OpenAI-compatible server
 |--------|------|-----|-----|-----|
 | TTFT (ms) | 1642.9 | 1642.1 | 1654.4 | 1661.6 |
 | TPOT (ms/tok) | 767.95 | 767.03 | 773.67 | 782.55 |
-| E2EL (s) | 17.00 | — | — | — |
+| E2EL (s) | 16.23 | 16.21 | 16.35 | 16.51 |
 
 **Throughput:** 1.2 output tokens/s (serial, concurrency=1)
 
