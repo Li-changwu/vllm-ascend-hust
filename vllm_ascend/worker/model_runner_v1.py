@@ -44,6 +44,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.offloader import get_offloader
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
@@ -3076,6 +3077,7 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
+        get_offloader().post_init()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -3948,12 +3950,15 @@ def _get_gpu_model_runner_module_name(model_runner) -> str:
 def _torch_cuda_wrapper():
     class _EventPlaceholder:
         def __init__(self, *args, **kwargs) -> None:
-            self.record = lambda: None
-            self.synchronize = lambda: None
+            self.record = lambda *args, **kwargs: None
+            self.synchronize = lambda *args, **kwargs: None
 
     class _StreamPlaceholder:
         def __init__(self, *args, **kwargs) -> None:
             pass
+
+    def _not_capturing(*args, **kwargs) -> bool:
+        return False
 
     try:
         # replace cuda APIs with xpu APIs, this should work by default
@@ -3965,6 +3970,7 @@ def _torch_cuda_wrapper():
         torch.cuda.stream = torch.npu.stream
         torch.cuda.synchronize = torch.npu.synchronize
         torch.cuda.mem_get_info = torch.npu.mem_get_info
+        torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
         yield
     except Exception as e:
         torch.cuda.Event = _EventPlaceholder
@@ -3974,16 +3980,18 @@ def _torch_cuda_wrapper():
         torch.cuda.stream = _StreamPlaceholder
         torch.cuda.synchronize = _StreamPlaceholder
         torch.cuda.mem_get_info = _StreamPlaceholder
+        torch.cuda.is_current_stream_capturing = _not_capturing
         raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
     finally:
-        # if anything goes wrong, just patch it with a placeholder
-        torch.cuda.Event = _EventPlaceholder
+        # Keep CUDA-shaped APIs routed to NPU implementations after init.
+        torch.cuda.Event = torch.npu.Event
         torch.cuda.Stream = torch.cuda.Stream
         torch.cuda.default_stream = torch.npu.default_stream
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream
         torch.cuda.synchronize = torch.npu.synchronize
         torch.cuda.mem_get_info = torch.npu.mem_get_info
+        torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
 
 
 # TODO: This method will be removed subsequently and implemented in platform.

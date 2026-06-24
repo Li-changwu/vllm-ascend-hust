@@ -12,6 +12,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
     MoEFusedExpertsInput,
+    MoEOffloadParams,
     MoEPrepareOutput,
     MoEQuantParams,
     MoERoutingParams,
@@ -23,6 +24,11 @@ from vllm_ascend.quantization.methods.base import QuantType
 
 class TestMoECommMethod(TestBase):
     def setUp(self):
+        self._fusion_patcher = patch(
+            "vllm_ascend.ops.fused_moe.moe_comm_method.set_gmmswigluquant_method",
+            return_value=False,
+        )
+        self._fusion_patcher.start()
         # Mock FusedMoEConfig
         self.moe_config = MagicMock(spec=FusedMoEConfig)
         self.moe_config.num_experts = 8
@@ -35,6 +41,9 @@ class TestMoECommMethod(TestBase):
         self.moe_config.ep_size = 1
         self.moe_config.dp_group = MagicMock()
         self.moe_config.global_redundant_expert_num = 0
+
+    def tearDown(self):
+        self._fusion_patcher.stop()
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
@@ -250,3 +259,166 @@ class TestMoECommMethod(TestBase):
             hidden_states=mock_unified_apply_mlp.return_value,
             combine_metadata=mock_td_instance.token_dispatch.return_value.combine_metadata,
         )
+
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.set_gmmswigluquant_method", return_value=False)
+    @patch("torch.npu.current_stream", MagicMock())
+    def test_fused_experts_applies_moe_offload_slot_plan_at_boundary(
+        self, mock_set_fusion, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
+    ):
+        del mock_set_fusion
+        del mock_prepare_finalize
+        mock_context = MagicMock()
+        mock_context.moe_comm_method = "all_gather"
+        mock_get_forward_context.return_value = mock_context
+
+        dispatch_topk_weights = torch.tensor([[0.5, 0.5], [0.3, 0.7]])
+        mock_td_instance = MagicMock()
+        mock_td_instance.token_dispatch.return_value = MoETokenDispatchOutput(
+            hidden_states=torch.randn(4, 8),
+            group_list=torch.tensor([2, 2]),
+            group_list_type=1,
+            combine_metadata=MoEAllGatherCombineMetadata(
+                topk_weights=dispatch_topk_weights,
+                expanded_row_idx=torch.arange(4, dtype=torch.int32),
+                restore_shape=torch.Size([2, 8]),
+            ),
+        )
+        mock_td_instance.token_combine.return_value = torch.randn(2, 8)
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        comm_impl = AllGatherCommImpl(self.moe_config)
+        topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+        original_w1 = torch.randn(3, 2, 4)
+        original_w2 = torch.randn(3, 4, 2)
+        slot_w1 = torch.randn(2, 2, 4)
+        slot_w2 = torch.randn(2, 4, 2)
+        slot_log2phy = torch.tensor([-1, 0, 1], dtype=torch.int32)
+        prepared = MagicMock(
+            w1=slot_w1,
+            w2=slot_w2,
+            log2phy=slot_log2phy,
+            physical_expert_count=2,
+        )
+        runtime = MagicMock()
+        runtime.prepare_fixed_slot_plan.return_value = prepared
+        runtime.should_use_fixed_slot_plan_for_layer.return_value = True
+
+        with (
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_offload_runtime", return_value=runtime),
+            patch.object(comm_impl, "_apply_mlp", return_value=torch.randn(4, 8)) as mock_apply_mlp,
+        ):
+            comm_impl.fused_experts(
+                fused_experts_input=MoEFusedExpertsInput(
+                    hidden_states=torch.randn(2, 8),
+                    topk_weights=dispatch_topk_weights,
+                    topk_ids=topk_ids,
+                    weights=MoEWeights(w1=original_w1, w2=original_w2),
+                    routing=MoERoutingParams(
+                        expert_map=None,
+                        global_redundant_expert_num=0,
+                        mc2_mask=None,
+                        apply_router_weight_on_input=False,
+                    ),
+                    activation="silu",
+                    need_trans=False,
+                    dynamic_eplb=False,
+                    quant=MoEQuantParams(),
+                    offload=MoEOffloadParams(
+                        enabled=True,
+                        layer_id=6,
+                        num_logical_experts=3,
+                        expected_device_type="cpu",
+                    ),
+                )
+            )
+
+        runtime.prepare_fixed_slot_plan.assert_called_once_with(
+            layer_id=6,
+            active_experts=(1, 2),
+            num_logical_experts=3,
+            device=topk_ids.device,
+        )
+        prepared.validate_backend_ready.assert_called_once_with(expected_device_type="cpu")
+        dispatch_input = mock_td_instance.token_dispatch.call_args.kwargs["token_dispatch_input"]
+        self.assertTrue(torch.equal(dispatch_input.topk_ids, slot_log2phy[topk_ids]))
+        mlp_compute_input = mock_apply_mlp.call_args.args[0]
+        self.assertIs(mlp_compute_input.weights.w1, slot_w1)
+        self.assertIs(mlp_compute_input.weights.w2, slot_w2)
+
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.set_gmmswigluquant_method", return_value=False)
+    @patch("torch.npu.current_stream", MagicMock())
+    def test_fused_experts_keeps_original_weights_when_offload_runtime_skips_slot_cache(
+        self, mock_set_fusion, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
+    ):
+        del mock_set_fusion
+        del mock_prepare_finalize
+        mock_context = MagicMock()
+        mock_context.moe_comm_method = "all_gather"
+        mock_get_forward_context.return_value = mock_context
+
+        dispatch_topk_weights = torch.ones(2, 3)
+        mock_td_instance = MagicMock()
+        mock_td_instance.token_dispatch.return_value = MoETokenDispatchOutput(
+            hidden_states=torch.randn(6, 8),
+            group_list=torch.tensor([2, 2, 2]),
+            group_list_type=1,
+            combine_metadata=MoEAllGatherCombineMetadata(
+                topk_weights=dispatch_topk_weights,
+                expanded_row_idx=torch.arange(6, dtype=torch.int32),
+                restore_shape=torch.Size([2, 8]),
+            ),
+        )
+        mock_td_instance.token_combine.return_value = torch.randn(2, 8)
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        comm_impl = AllGatherCommImpl(self.moe_config)
+        topk_ids = torch.tensor([[0, 1, 2], [2, 1, 0]], dtype=torch.int32)
+        original_w1 = torch.randn(3, 2, 4)
+        original_w2 = torch.randn(3, 4, 2)
+        runtime = MagicMock()
+        runtime.should_use_fixed_slot_plan_for_layer.return_value = True
+        runtime.should_use_slot_cache_for_active_experts.return_value = False
+
+        with (
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_offload_runtime", return_value=runtime),
+            patch.object(comm_impl, "_apply_mlp", return_value=torch.randn(6, 8)) as mock_apply_mlp,
+        ):
+            comm_impl.fused_experts(
+                fused_experts_input=MoEFusedExpertsInput(
+                    hidden_states=torch.randn(2, 8),
+                    topk_weights=dispatch_topk_weights,
+                    topk_ids=topk_ids,
+                    weights=MoEWeights(w1=original_w1, w2=original_w2),
+                    routing=MoERoutingParams(
+                        expert_map=None,
+                        global_redundant_expert_num=0,
+                        mc2_mask=None,
+                        apply_router_weight_on_input=False,
+                    ),
+                    activation="silu",
+                    need_trans=False,
+                    dynamic_eplb=False,
+                    quant=MoEQuantParams(),
+                    offload=MoEOffloadParams(
+                        enabled=True,
+                        layer_id=6,
+                        num_logical_experts=3,
+                        expected_device_type="cpu",
+                    ),
+                )
+            )
+
+        runtime.should_use_slot_cache_for_active_experts.assert_called_once_with(
+            layer_id=6,
+            active_experts=(0, 1, 2),
+        )
+        runtime.prepare_fixed_slot_plan.assert_not_called()
+        mlp_compute_input = mock_apply_mlp.call_args.args[0]
+        self.assertIs(mlp_compute_input.weights.w1, original_w1)
+        self.assertIs(mlp_compute_input.weights.w2, original_w2)
