@@ -237,6 +237,28 @@ MoE offload currently runs through the eager path. Keep `--enforce-eager`
 enabled for this prototype because graph capture cannot record the runtime CPU
 decision path used by the offload scheduler.
 
+## Benchmark: Qwen3-30B-A3B on Ascend NPU
+
+Tested with 100 ShareGPT prompts against a running vLLM OpenAI-compatible server.
+
+**Configuration:**
+- Model: `Qwen/Qwen3-30B-A3B`
+- Backend: Ascend NPU (1 device), `bfloat16`
+- `--max-model-len 512`, `--max-num-seqs 1`, `--max-num-batched-tokens 512`
+- `--kv-cache-memory-bytes 536870912`, `--ascend-moe-offload-gb 14`, `--enforce-eager`
+
+**Results (100 requests, concurrency=1, max_tokens=20):**
+
+| Metric | mean | p50 | p90 | p99 |
+|--------|------|-----|-----|-----|
+| TTFT (ms) | 1642.9 | 1642.1 | 1654.4 | 1661.6 |
+| TPOT (ms/tok) | 767.95 | 767.03 | 773.67 | 782.55 |
+| E2EL (s) | 17.00 | — | — | — |
+
+**Throughput:** 1.2 output tokens/s (serial, concurrency=1)
+
+> The primary bottleneck is `--ascend-moe-offload-gb 14`, which offloads MoE expert weights to CPU and incurs PCIe transfer overhead on every decode step.
+
 ## Contributing
 
 See [CONTRIBUTING](https://docs.vllm.ai/projects/ascend/en/latest/developer_guide/contribution/index.html) for more details, which is a step-by-step guide to help you set up the development environment, build and test.
