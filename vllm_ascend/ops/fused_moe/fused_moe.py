@@ -48,7 +48,10 @@ from vllm_ascend.flash_common3_context import get_flash_common3_context, set_fla
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
-from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
+try:
+    from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
+except ImportError:
+    from vllm_ascend._moe_offload_null import get_moe_offload_runtime
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (

@@ -35,8 +35,11 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     build_mlp_compute_input,
     build_token_dispatch_input,
 )
-from vllm_ascend.moe_offload.runtime import MoeOffloadDecisionPath, get_moe_offload_runtime
-from vllm_ascend.moe_offload.pipeline import get_moe_pipeline_profiler
+try:
+    from vllm_ascend.moe_offload.runtime import MoeOffloadDecisionPath, get_moe_offload_runtime
+    from vllm_ascend.moe_offload.pipeline import get_moe_pipeline_profiler
+except ImportError:
+    from vllm_ascend._moe_offload_null import MoeOffloadDecisionPath, get_moe_offload_runtime, get_moe_pipeline_profiler
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
