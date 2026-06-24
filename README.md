@@ -243,7 +243,7 @@ Tested with 100 ShareGPT prompts against a running vLLM OpenAI-compatible server
 
 **Configuration:**
 - Model: `Qwen/Qwen3-30B-A3B`
-- Benchmark: [text](benchmarks/scripts/bench_sharegpt.py)
+- Benchmark: [ShareGPT_Benchmark](benchmarks/scripts/bench_sharegpt.py)
 - Backend: Ascend NPU (1 device), `bfloat16`
 - `--max-model-len 512`, `--max-num-seqs 1`, `--max-num-batched-tokens 512`
 - `--kv-cache-memory-bytes 536870912`, `--ascend-moe-offload-gb 14`, `--enforce-eager`
