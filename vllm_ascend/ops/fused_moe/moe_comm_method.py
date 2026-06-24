@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
@@ -27,10 +28,18 @@ from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
     MoEMlpComputeInput,
+    MoEOffloadParams,
     MoEPrepareOutput,
+    MoERoutingParams,
+    MoEWeights,
     build_mlp_compute_input,
     build_token_dispatch_input,
 )
+try:
+    from vllm_ascend.moe_offload.runtime import MoeOffloadDecisionPath, get_moe_offload_runtime
+    from vllm_ascend.moe_offload.pipeline import get_moe_pipeline_profiler
+except ImportError:
+    from vllm_ascend._moe_offload_null import MoeOffloadDecisionPath, get_moe_offload_runtime, get_moe_pipeline_profiler
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
@@ -124,16 +133,90 @@ class MoECommMethod(ABC):
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
 
-        before_dispatch_evt = torch.npu.current_stream().record_event()
-        routed_topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
+        # --- P0 pipeline profiling: npu.Event trace-only timing ---
+        pipeline_profiler = get_moe_pipeline_profiler()
+        do_pipe_profile = pipeline_profiler.enabled
+        if do_pipe_profile:
+            e0 = pipeline_profiler.record()  # before Stage T (offload plan / transfer)
 
-        token_dispatch_input = build_token_dispatch_input(
-            fused_experts_input=fused_experts_input,
-            topk_ids=routed_topk_ids,
-        )
-        token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        before_dispatch_evt = torch.npu.current_stream().record_event()
+        fused_experts_input = self._maybe_apply_moe_offload_plan(fused_experts_input)
+
+        detail_ctx = None
+        if do_pipe_profile:
+            e1 = pipeline_profiler.record()  # after Stage T, before Stage R
+            detail_layer_id = (
+                getattr(fused_experts_input.offload, "layer_id", -1)
+                if fused_experts_input.offload
+                else -1
+            )
+            detail_step_id = (
+                getattr(fused_experts_input.offload, "step_id", -1)
+                if fused_experts_input.offload
+                else -1
+            )
+            detail_manager = pipeline_profiler.detail_context(
+                layer_id=detail_layer_id,
+                step_id=detail_step_id,
+            )
+        else:
+            detail_manager = None
+
+        if detail_manager is None:
+            routed_topk_ids = fused_experts_input.topk_ids
+            if fused_experts_input.routing.log2phy is not None:
+                routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
+
+            token_dispatch_input = build_token_dispatch_input(
+                fused_experts_input=fused_experts_input,
+                topk_ids=routed_topk_ids,
+            )
+            token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        else:
+            with detail_manager as detail_ctx:
+                routed_topk_ids = fused_experts_input.topk_ids
+                if fused_experts_input.routing.log2phy is not None:
+                    map_start = pipeline_profiler.record()
+                    routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
+                    map_end = pipeline_profiler.record()
+                    pipeline_profiler.add_detail_event(
+                        "r_log2phy_map",
+                        start=map_start,
+                        end=map_end,
+                        payload={
+                            "topk_ids_shape": list(fused_experts_input.topk_ids.shape),
+                            "log2phy_shape": list(fused_experts_input.routing.log2phy.shape),
+                        },
+                    )
+
+                build_start = perf_counter()
+                token_dispatch_input = build_token_dispatch_input(
+                    fused_experts_input=fused_experts_input,
+                    topk_ids=routed_topk_ids,
+                )
+                pipeline_profiler.add_wall_detail_timing(
+                    "r_build_dispatch_input",
+                    duration_ms=(perf_counter() - build_start) * 1000.0,
+                    payload={
+                        "hidden_shape": list(fused_experts_input.hidden_states.shape),
+                        "topk_ids_shape": list(routed_topk_ids.shape),
+                    },
+                )
+
+                dispatch_start = pipeline_profiler.record()
+                token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+                dispatch_end = pipeline_profiler.record()
+                pipeline_profiler.add_detail_event(
+                    "r_token_dispatch_total",
+                    start=dispatch_start,
+                    end=dispatch_end,
+                    payload={
+                        "physical_expert_count": fused_experts_input.routing.physical_expert_count,
+                    },
+                )
+
+        if do_pipe_profile:
+            e2 = pipeline_profiler.record()  # after Stage R, before Stage C
 
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
@@ -141,13 +224,44 @@ class MoECommMethod(ABC):
             use_fusion_ops=self.use_fusion_ops,
         )
 
-        mlp_output = self._apply_mlp(mlp_compute_input)
+        # --- MVP-D.11: post-dispatch phase split (default off) ---
+        _phase_split_enabled, _phase_plan, _phase_fail_reason = self._maybe_plan_phase_split(
+            fused_experts_input=fused_experts_input,
+            mlp_compute_input=mlp_compute_input,
+            token_dispatch_output=token_dispatch_output,
+        )
+        if _phase_split_enabled and _phase_plan is not None:
+            from vllm_ascend.moe_offload.phase_split import execute_phased_mlp
+
+            mlp_output = execute_phased_mlp(
+                mlp_compute_input=mlp_compute_input,
+                phase_plan=_phase_plan,
+            )
+        elif _phase_split_enabled and _phase_fail_reason is not None:
+            raise RuntimeError(
+                "MoE phase split failed closed: " + _phase_fail_reason
+            )
+        else:
+            mlp_output = self._apply_mlp(mlp_compute_input)
+
+        if do_pipe_profile:
+            e3 = pipeline_profiler.record()  # after Stage C, before Stage M
 
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,
             combine_metadata=token_dispatch_output.combine_metadata,
         )
+
+        if do_pipe_profile:
+            e4 = pipeline_profiler.record()  # after Stage M
+            step_id = getattr(fused_experts_input.offload, "step_id", -1) if fused_experts_input.offload else -1
+            pipeline_profiler.commit(
+                layer_id=getattr(fused_experts_input.offload, "layer_id", -1) if fused_experts_input.offload else -1,
+                step_id=step_id,
+                events=(e0, e1, e2, e3, e4),
+            )
+            pipeline_profiler.commit_detail_context(detail_ctx)
 
         return FusedExpertsResult(
             routed_out=routed_out,
@@ -160,6 +274,176 @@ class MoECommMethod(ABC):
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
 
+    def _maybe_plan_phase_split(
+        self,
+        *,
+        fused_experts_input: MoEFusedExpertsInput,
+        mlp_compute_input: MoEMlpComputeInput,
+        token_dispatch_output,
+    ) -> tuple[bool, object | None, str | None]:
+        """MVP-D.11: decide whether to split MLP into phases.
+
+        Returns ``(enabled, phase_plan | None, fail_reason | None)``.
+        """
+        runtime = get_moe_offload_runtime()
+        if not runtime.config.phase_split_enabled:
+            return False, None, None
+
+        # --- Narrow-path gate ---
+        # D.11 supports: AllGather + unquantized + no bias + no EP.
+        from vllm_ascend.ascend_forward_context import MoECommType as _MoECommType
+
+        if _EXTRA_CTX.moe_comm_type != _MoECommType.ALLGATHER:
+            return True, None, "phase_split_requires_AllGather"
+        if mlp_compute_input.quant.is_quant:
+            return True, None, "phase_split_requires_unquantized"
+        if fused_experts_input.weights.w1_bias is not None or fused_experts_input.weights.w2_bias is not None:
+            return True, None, "phase_split_requires_no_bias"
+        if fused_experts_input.routing.expert_map is not None:
+            return True, None, "phase_split_requires_no_expert_map"
+
+        # --- Build phase plan ---
+        from vllm_ascend.moe_offload.phase_split import (
+            MoEPhasePlan,
+            PhaseSplitProfileEvent,
+            _write_phase_split_profile_jsonl,
+            compute_expert_token_slices,
+            plan_hit_miss_phases,
+        )
+
+        offload = fused_experts_input.offload
+        layer_id = offload.layer_id if offload is not None else -1
+
+        try:
+            group_list = mlp_compute_input.group_list
+            group_list_type = mlp_compute_input.group_list_type
+
+            expert_slices = compute_expert_token_slices(group_list, group_list_type)
+            num_experts_in_group = len(expert_slices)
+
+            # Active expert ids are 0..(num_experts_in_group-1) — the group_list
+            # is already permuted to the local expert order.
+            active_expert_ids = tuple(range(num_experts_in_group))
+
+            # Build slot readiness map from the offload runtime.
+            slot_readiness: dict[int, bool] = {}
+            if offload is not None and offload.enabled and runtime.should_use_fixed_slot_plan_for_layer(layer_id):
+                slot_bank = runtime._slot_banks.get(layer_id)
+                if slot_bank is not None:
+                    for expert_id in active_expert_ids:
+                        from vllm_ascend.moe_offload.expert_key import ExpertKey
+                        from vllm_ascend.moe_offload.slot_bank import SlotState
+
+                        key = ExpertKey(layer_id, int(expert_id))
+                        slot = slot_bank.lookup(key)
+                        slot_readiness[int(expert_id)] = (
+                            slot is not None and slot.state == SlotState.READY
+                        )
+
+            max_phases = runtime.config.max_phases
+            phase_plan: MoEPhasePlan = plan_hit_miss_phases(
+                expert_slices=expert_slices,
+                active_expert_ids=active_expert_ids,
+                slot_readiness=slot_readiness if slot_readiness else None,
+                max_phases=max_phases,
+            )
+
+            # Observability
+            event = PhaseSplitProfileEvent(
+                name="phase_split_plan",
+                layer_id=layer_id,
+                seconds=0.0,  # plan time is negligible at this point
+                phase_plan_jsonable=phase_plan.to_jsonable(),
+            )
+            _write_phase_split_profile_jsonl(event)
+
+            return True, phase_plan, None
+
+        except Exception as exc:
+            fail_reason = f"phase_split_plan_failed: {exc}"
+            event = PhaseSplitProfileEvent(
+                name="phase_split_fail_closed",
+                layer_id=layer_id,
+                seconds=0.0,
+                fail_reason=fail_reason,
+            )
+            _write_phase_split_profile_jsonl(event)
+            return True, None, fail_reason
+
+    def _maybe_apply_moe_offload_plan(self, fused_experts_input: MoEFusedExpertsInput) -> MoEFusedExpertsInput:
+        offload = fused_experts_input.offload
+        if offload is None or not offload.enabled:
+            return fused_experts_input
+
+        runtime = get_moe_offload_runtime()
+        active_experts = tuple(
+            int(expert_id) for expert_id in torch.unique(fused_experts_input.topk_ids.detach().cpu()).tolist()
+        )
+        step_id = _next_offload_step_id(runtime, offload.step_id)
+        use_slot_cache_path = True
+        if runtime.should_use_layered_runtime:
+            decision = runtime.decide_layered_path(
+                layer_id=offload.layer_id,
+                active_experts=active_experts,
+                step_id=step_id,
+            )
+            if decision.path is MoeOffloadDecisionPath.FAIL_CLOSED:
+                raise RuntimeError(
+                    "MoE offload layered runtime failed closed: "
+                    f"layer_id={offload.layer_id}, reason={decision.reason}"
+                )
+            use_slot_cache_path = decision.path is MoeOffloadDecisionPath.SLOT_CACHE_PATH
+
+        if not use_slot_cache_path:
+            return fused_experts_input
+
+        prepared_weights = runtime.prepare_fixed_slot_plan(
+            layer_id=offload.layer_id,
+            step_id=step_id,
+            active_experts=active_experts,
+            num_logical_experts=offload.num_logical_experts,
+            device=fused_experts_input.topk_ids.device,
+        )
+        prepared_weights.validate_backend_ready(expected_device_type=offload.expected_device_type)
+        return MoEFusedExpertsInput(
+            hidden_states=fused_experts_input.hidden_states,
+            topk_weights=fused_experts_input.topk_weights,
+            topk_ids=fused_experts_input.topk_ids,
+            weights=MoEWeights(
+                w1=prepared_weights.w1,
+                w2=prepared_weights.w2,
+                w1_bias=fused_experts_input.weights.w1_bias,
+                w2_bias=fused_experts_input.weights.w2_bias,
+                w1_scale=fused_experts_input.weights.w1_scale,
+                w2_scale=fused_experts_input.weights.w2_scale,
+                w1_scale_bias=fused_experts_input.weights.w1_scale_bias,
+                w2_scale_bias=fused_experts_input.weights.w2_scale_bias,
+                w1_offset=fused_experts_input.weights.w1_offset,
+                w2_offset=fused_experts_input.weights.w2_offset,
+            ),
+            routing=MoERoutingParams(
+                expert_map=fused_experts_input.routing.expert_map,
+                global_redundant_expert_num=fused_experts_input.routing.global_redundant_expert_num,
+                mc2_mask=fused_experts_input.routing.mc2_mask,
+                apply_router_weight_on_input=fused_experts_input.routing.apply_router_weight_on_input,
+                log2phy=prepared_weights.log2phy,
+                physical_expert_count=prepared_weights.physical_expert_count,
+                pertoken_scale=fused_experts_input.routing.pertoken_scale,
+            ),
+            quant=fused_experts_input.quant,
+            activation=fused_experts_input.activation,
+            need_trans=fused_experts_input.need_trans,
+            dynamic_eplb=fused_experts_input.dynamic_eplb,
+            offload=MoEOffloadParams(
+                enabled=offload.enabled,
+                profile_only=offload.profile_only,
+                layer_id=offload.layer_id,
+                num_logical_experts=offload.num_logical_experts,
+                expected_device_type=offload.expected_device_type,
+                step_id=step_id,
+            ),
+        )
+
     @abstractmethod
     def _get_token_dispatcher(self) -> MoETokenDispatcher:
         raise NotImplementedError("_get_token_dispatcher function not implemented.")
@@ -167,6 +451,15 @@ class MoECommMethod(ABC):
     @abstractmethod
     def _get_prepare_finalize(self) -> PrepareAndFinalize:
         raise NotImplementedError("_get_prepare_finalize function not implemented.")
+
+
+def _next_offload_step_id(runtime, fallback_step_id: int = -1) -> int:
+    if int(fallback_step_id) >= 0:
+        return int(fallback_step_id)
+    next_step_id = getattr(type(runtime), "next_step_id", None)
+    if callable(next_step_id):
+        return int(next_step_id(runtime))
+    return 0
 
 
 class AllGatherCommImpl(MoECommMethod):
