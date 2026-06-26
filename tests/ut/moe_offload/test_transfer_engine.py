@@ -20,7 +20,7 @@ import torch
 from vllm_ascend.moe_offload.expert_key import ExpertKey
 from vllm_ascend.moe_offload.host_store import ExpertWeightBundle
 from vllm_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
-from vllm_ascend.moe_offload.transfer_engine import TransferEngine
+from vllm_ascend.moe_offload.transfer_engine import ExpertTransfer, TransferEngine
 
 
 def test_transfer_engine_sync_load_copies_bundle_into_slot_and_marks_ready():
@@ -40,3 +40,32 @@ def test_transfer_engine_sync_load_copies_bundle_into_slot_and_marks_ready():
     assert torch.equal(slot.w2, bundle.w2)
     assert slot.w13.data_ptr() != bundle.w13.data_ptr()
     assert slot.w2.data_ptr() != bundle.w2.data_ptr()
+
+
+def test_transfer_engine_batch_load_copies_contiguous_expert_views():
+    bank = ExpertSlotBank(2, (2, 4), (4, 2), dtype=torch.float32, device=torch.device("cpu"))
+    slots = bank.allocate_contiguous_for(
+        (ExpertKey(0, 1), ExpertKey(0, 2)),
+        step_id=0,
+        max_batch_size=8,
+    )
+    w13 = torch.arange(2 * 2 * 4, dtype=torch.float32).reshape(2, 2, 4)
+    w2 = torch.arange(2 * 4 * 2, dtype=torch.float32).reshape(2, 4, 2)
+    transfers = [
+        ExpertTransfer(
+            bundle=ExpertWeightBundle(
+                layer_id=0,
+                expert_id=expert_id,
+                w13=w13[index],
+                w2=w2[index],
+            ),
+            slot=slot,
+        )
+        for index, (expert_id, slot) in enumerate(zip((1, 2), slots))
+    ]
+
+    TransferEngine().load_batch_sync(transfers)
+
+    assert [slot.state for slot in slots] == [SlotState.READY, SlotState.READY]
+    assert torch.equal(bank.w13_slots[:2], w13)
+    assert torch.equal(bank.w2_slots[:2], w2)

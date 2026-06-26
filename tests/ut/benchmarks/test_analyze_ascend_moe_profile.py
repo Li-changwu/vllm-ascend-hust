@@ -183,11 +183,19 @@ def append_offload_timeline_profile(output: Path) -> None:
             },
             {
                 "event": "moe_offload_timeline",
-                "name": "expert_h2d_load_sync",
+                "name": "expert_h2d_batch_load_sync",
                 "layer_id": 1,
                 "step_id": 3,
                 "duration_us": 200.0,
-                "payload": {"expert_id": 2, "slot_id": 0, "bytes": 8192},
+                "payload": {"expert_ids": [2], "slot_ids": [0], "bytes": 8192, "batch_size": 1},
+            },
+            {
+                "event": "moe_offload_timeline",
+                "name": "expert_h2d_load_sync",
+                "layer_id": 1,
+                "step_id": 3,
+                "duration_us": 0.0,
+                "payload": {"expert_id": 2, "slot_id": 0, "bytes": 8192, "batched": True},
             },
         ):
             f.write(json.dumps(record) + "\n")
@@ -425,10 +433,10 @@ def test_analyzer_summarizes_offload_timeline_events(tmp_path):
     report = analyzer.analyze_profile("decode", output, None)
 
     timeline = report["pipeline_profile"]["offload_timeline"]
-    assert timeline["record_count"] == 3
+    assert timeline["record_count"] == 4
     assert timeline["cache"] == {"hits": 1, "misses": 1, "hit_rate": 0.5}
     assert timeline["h2d_bytes"] == 8192
-    assert timeline["stages"][0]["name"] == "expert_h2d_load_sync"
+    assert timeline["stages"][0]["name"] == "expert_h2d_batch_load_sync"
     assert timeline["stages"][0]["total_ms"] == 0.2
 
 

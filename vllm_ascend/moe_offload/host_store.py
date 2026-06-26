@@ -59,6 +59,8 @@ class HostExpertStore:
     def __init__(self) -> None:
         self._weights: dict[ExpertKey, ExpertWeightBundle] = {}
         self._layer_signatures: dict[int, HostExpertLayerSignature] = {}
+        self._layer_w13_weights: dict[int, torch.Tensor] = {}
+        self._layer_w2_weights: dict[int, torch.Tensor] = {}
 
     def register_layer(self, layer: torch.nn.Module) -> None:
         layer_id = int(getattr(layer, "layer_id", -1))
@@ -71,22 +73,26 @@ class HostExpertStore:
         if num_experts <= 0:
             raise ValueError("host expert store requires at least one expert")
         self._weights = {key: bundle for key, bundle in self._weights.items() if key.layer_id != layer_id}
+        w13_cpu = w13_weight.detach().cpu().clone().contiguous()
+        w2_cpu = w2_weight.detach().cpu().clone().contiguous()
+        self._layer_w13_weights[layer_id] = w13_cpu
+        self._layer_w2_weights[layer_id] = w2_cpu
         self._layer_signatures[layer_id] = HostExpertLayerSignature(
             layer_id=layer_id,
             num_experts=num_experts,
-            w13_shape=tuple(int(dim) for dim in w13_weight.shape[1:]),
-            w13_dtype=w13_weight.dtype,
-            w13_stride=_expert_stride(w13_weight),
-            w2_shape=tuple(int(dim) for dim in w2_weight.shape[1:]),
-            w2_dtype=w2_weight.dtype,
-            w2_stride=_expert_stride(w2_weight),
+            w13_shape=tuple(int(dim) for dim in w13_cpu.shape[1:]),
+            w13_dtype=w13_cpu.dtype,
+            w13_stride=_expert_stride(w13_cpu),
+            w2_shape=tuple(int(dim) for dim in w2_cpu.shape[1:]),
+            w2_dtype=w2_cpu.dtype,
+            w2_stride=_expert_stride(w2_cpu),
         )
         for expert_id in range(num_experts):
             bundle = ExpertWeightBundle(
                 layer_id=layer_id,
                 expert_id=expert_id,
-                w13=w13_weight[expert_id].detach().cpu().clone(),
-                w2=w2_weight[expert_id].detach().cpu().clone(),
+                w13=w13_cpu[expert_id],
+                w2=w2_cpu[expert_id],
             )
             self._weights[bundle.key] = bundle
 

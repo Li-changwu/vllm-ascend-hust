@@ -96,6 +96,42 @@ class ExpertSlotBank:
         self._resident[expert_key] = slot.slot_id
         return slot
 
+    def allocate_contiguous_for(
+        self,
+        expert_keys: tuple[ExpertKey, ...],
+        *,
+        step_id: int,
+        max_batch_size: int,
+    ) -> list[ExpertSlot]:
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be greater than 0")
+        if not expert_keys:
+            return []
+        allocated: list[ExpertSlot] = []
+        for chunk in _chunks(expert_keys, max_batch_size):
+            allocated.extend(self._allocate_contiguous_chunk(chunk, step_id=step_id))
+        return allocated
+
+    def _allocate_contiguous_chunk(
+        self,
+        expert_keys: tuple[ExpertKey, ...],
+        *,
+        step_id: int,
+    ) -> list[ExpertSlot]:
+        slots = self._contiguous_evictable_slots(len(expert_keys))
+        if slots is None:
+            return [self.allocate_for(key, step_id=step_id) for key in expert_keys]
+
+        for slot, expert_key in zip(slots, expert_keys):
+            if slot.expert_key is not None:
+                self._resident.pop(slot.expert_key, None)
+            slot.expert_key = expert_key
+            slot.state = SlotState.LOADING
+            slot.version += 1
+            slot.last_used_step = int(step_id)
+            self._resident[expert_key] = slot.slot_id
+        return slots
+
     def mark_ready(self, slot_id: int) -> None:
         self.slots[int(slot_id)].state = SlotState.READY
 
@@ -125,6 +161,30 @@ class ExpertSlotBank:
             return None
         return min(candidates, key=lambda slot: (slot.last_used_step, slot.slot_id))
 
+    def _contiguous_evictable_slots(self, count: int) -> list[ExpertSlot] | None:
+        if count <= 0:
+            return []
+        best_window: list[ExpertSlot] | None = None
+        best_score: tuple[int, int, int] | None = None
+        for start in range(0, len(self.slots) - count + 1):
+            window = self.slots[start : start + count]
+            if any(slot.state not in (SlotState.EMPTY, SlotState.READY) for slot in window):
+                continue
+            ready_slots = [slot for slot in window if slot.state == SlotState.READY]
+            score = (
+                len(ready_slots),
+                max((slot.last_used_step for slot in ready_slots), default=-1),
+                start,
+            )
+            if best_score is None or score < best_score:
+                best_window = window
+                best_score = score
+        return best_window
+
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _chunks(values: tuple[ExpertKey, ...], size: int) -> list[tuple[ExpertKey, ...]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]

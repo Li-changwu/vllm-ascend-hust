@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument(
         "--mode",
-        choices=("no_offload", "trace_only", "fixed_slot_sync"),
+        choices=("no_offload", "trace_only", "fixed_slot_sync", "fixed_slot_async"),
         default="fixed_slot_sync",
         help="Single-process smoke mode. Run modes separately for correctness comparison.",
     )
@@ -176,13 +176,13 @@ def configure_sew_offload_env(
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY"] = "1"
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS"] = "0"
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH"] = trace_path
-    elif mode == "fixed_slot_sync":
+    elif mode in {"fixed_slot_sync", "fixed_slot_async"}:
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_ENABLED"] = "1"
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY"] = "0"
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS"] = str(int(num_slots))
     else:
         raise ValueError(f"unsupported smoke mode: {mode}")
-    os.environ["VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD"] = "0"
+    os.environ["VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD"] = "1" if mode == "fixed_slot_async" else "0"
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_MAX_PHASES"] = "1"
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS"] = resident_layer_ids
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS"] = (
@@ -314,7 +314,7 @@ def _build_llm_kwargs(args: argparse.Namespace, config: dict[str, Any], mode: st
         "seed": int(config["dataset"]["seed"]),
         "disable_log_stats": False,
     }
-    if mode == "fixed_slot_sync" and getattr(args, "with_native_offload_backend", False):
+    if mode in {"fixed_slot_sync", "fixed_slot_async"} and getattr(args, "with_native_offload_backend", False):
         # SEW manages its own offloading via host store + slot bank + original
         # weight release. The native vLLM offloader is a separate system that
         # requires pinned CPU storage and conflicts with SEW when both manage
@@ -384,9 +384,13 @@ def run_smoke(
             "status": "ok",
             "mode": mode,
             "model": llm_kwargs["model"],
-            "num_slots": int(args.num_slots) if mode == "fixed_slot_sync" else 0,
-            "layered_runtime": bool(getattr(args, "layered_runtime", False)) if mode == "fixed_slot_sync" else False,
-            "fanout_threshold": int(getattr(args, "fanout_threshold", 0)) if mode == "fixed_slot_sync" else 0,
+            "num_slots": int(args.num_slots) if mode.startswith("fixed_slot_") else 0,
+            "layered_runtime": bool(getattr(args, "layered_runtime", False))
+            if mode.startswith("fixed_slot_")
+            else False,
+            "fanout_threshold": int(getattr(args, "fanout_threshold", 0))
+            if mode.startswith("fixed_slot_")
+            else 0,
             "load_seconds": load_s,
             "manifest": str(args.manifest),
             "buckets": args.buckets,

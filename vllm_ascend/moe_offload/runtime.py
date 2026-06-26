@@ -33,7 +33,12 @@ from vllm_ascend.moe_offload.slot_mapping import ExpertSlotMapping, PreparedSlot
 from vllm_ascend.moe_offload.trace_collector import TraceCollector, TraceRecord
 from vllm_ascend.moe_offload.expert_weight_release import release_layer_original_expert_weights
 from vllm_ascend.moe_offload.tiered_residency import TieredResidencyPolicy
-from vllm_ascend.moe_offload.transfer_engine import TransferEngine
+from vllm_ascend.moe_offload.transfer_engine import (
+    DEFAULT_EXPERT_TRANSFER_BATCH_SIZE,
+    ExpertTransfer,
+    ExpertTransferHandle,
+    TransferEngine,
+)
 
 
 @dataclass(frozen=True)
@@ -535,52 +540,120 @@ class MoeOffloadRuntime:
                     },
                 )
 
+        miss_expert_ids = tuple(
+            int(expert_id)
+            for expert_id in unique_active_experts
+            if not _slot_ready(slot_bank, ExpertKey(layer_id, int(expert_id)))
+        )
+        miss_transfer_chunks: list[list[ExpertTransfer]] = []
+        for miss_chunk in _chunks(miss_expert_ids, DEFAULT_EXPERT_TRANSFER_BATCH_SIZE):
+            miss_keys = tuple(ExpertKey(layer_id, expert_id) for expert_id in miss_chunk)
             allocate_start_ns = perf_counter_ns() if timeline_enabled else 0
-            slot = slot_bank.allocate_for(key, step_id=step_id)
+            slots = slot_bank.allocate_contiguous_for(
+                miss_keys,
+                step_id=step_id,
+                max_batch_size=DEFAULT_EXPERT_TRANSFER_BATCH_SIZE,
+            )
             if timeline_enabled:
                 self._record_timeline_event(
-                    "slot_allocate",
+                    "slot_batch_allocate",
                     layer_id=layer_id,
                     step_id=step_id,
                     start_ns=allocate_start_ns,
                     end_ns=perf_counter_ns(),
                     payload={
-                        "expert_id": int(expert_id),
-                        "slot_id": int(slot.slot_id),
-                        "slot_version": int(slot.version),
+                        "expert_ids": [int(key.expert_id) for key in miss_keys],
+                        "slot_ids": [int(slot.slot_id) for slot in slots],
+                        "slot_versions": [int(slot.version) for slot in slots],
+                        "batch_size": len(slots),
                     },
                 )
 
-            host_lookup_start_ns = perf_counter_ns() if timeline_enabled else 0
-            bundle = self._host_store.get(layer_id, int(expert_id))
-            if timeline_enabled:
-                self._record_timeline_event(
-                    "host_bundle_lookup",
-                    layer_id=layer_id,
-                    step_id=step_id,
-                    start_ns=host_lookup_start_ns,
-                    end_ns=perf_counter_ns(),
-                    payload={
-                        "expert_id": int(expert_id),
-                        "slot_id": int(slot.slot_id),
-                    },
-                )
+            transfer_chunk: list[ExpertTransfer] = []
+            for key, slot in zip(miss_keys, slots):
+                if timeline_enabled:
+                    self._record_timeline_event(
+                        "slot_allocate",
+                        layer_id=layer_id,
+                        step_id=step_id,
+                        start_ns=allocate_start_ns,
+                        end_ns=allocate_start_ns,
+                        payload={
+                            "expert_id": int(key.expert_id),
+                            "slot_id": int(slot.slot_id),
+                            "slot_version": int(slot.version),
+                            "batched": True,
+                        },
+                    )
 
+                host_lookup_start_ns = perf_counter_ns() if timeline_enabled else 0
+                bundle = self._host_store.get(layer_id, int(key.expert_id))
+                if timeline_enabled:
+                    self._record_timeline_event(
+                        "host_bundle_lookup",
+                        layer_id=layer_id,
+                        step_id=step_id,
+                        start_ns=host_lookup_start_ns,
+                        end_ns=perf_counter_ns(),
+                        payload={
+                            "expert_id": int(key.expert_id),
+                            "slot_id": int(slot.slot_id),
+                        },
+                    )
+                transfer_chunk.append(ExpertTransfer(bundle=bundle, slot=slot))
+            miss_transfer_chunks.append(transfer_chunk)
+
+        transfer_handle: ExpertTransferHandle | None = None
+        transfer_handles: list[ExpertTransferHandle] = []
+        for miss_transfers in miss_transfer_chunks:
+            if not miss_transfers:
+                continue
             transfer_start_ns = perf_counter_ns() if timeline_enabled else 0
-            self._transfer_engine.load_sync(bundle, slot)
+            if self.config.async_load:
+                handle = self._transfer_engine.load_batch_async(miss_transfers)
+                if not handle.is_empty():
+                    transfer_handles.append(handle)
+            else:
+                self._transfer_engine.load_batch_sync(miss_transfers)
             if timeline_enabled:
                 self._record_timeline_event(
-                    "expert_h2d_load_sync",
+                    "expert_h2d_batch_load_sync",
                     layer_id=layer_id,
                     step_id=step_id,
                     start_ns=transfer_start_ns,
                     end_ns=perf_counter_ns(),
                     payload={
-                        "expert_id": int(expert_id),
-                        "slot_id": int(slot.slot_id),
-                        "bytes": _bundle_nbytes(bundle),
+                        "expert_ids": [
+                            int(transfer.bundle.expert_id)
+                            for transfer in miss_transfers
+                        ],
+                        "slot_ids": [
+                            int(transfer.slot.slot_id)
+                            for transfer in miss_transfers
+                        ],
+                        "bytes": sum(_bundle_nbytes(transfer.bundle) for transfer in miss_transfers),
+                        "batch_size": len(miss_transfers),
+                        "max_batch_size": DEFAULT_EXPERT_TRANSFER_BATCH_SIZE,
+                        "async": bool(self.config.async_load),
                     },
                 )
+                batch_start_ns = transfer_start_ns
+                for transfer in miss_transfers:
+                    self._record_timeline_event(
+                        "expert_h2d_load_sync",
+                        layer_id=layer_id,
+                        step_id=step_id,
+                        start_ns=batch_start_ns,
+                        end_ns=batch_start_ns,
+                        payload={
+                            "expert_id": int(transfer.bundle.expert_id),
+                            "slot_id": int(transfer.slot.slot_id),
+                            "bytes": _bundle_nbytes(transfer.bundle),
+                            "batched": True,
+                        },
+                    )
+        if transfer_handles:
+            transfer_handle = ExpertTransferHandle(children=tuple(transfer_handles))
 
         mapping_start_ns = perf_counter_ns() if timeline_enabled else 0
         mapping = ExpertSlotMapping.from_slot_bank(
@@ -589,6 +662,7 @@ class MoeOffloadRuntime:
             num_logical_experts=num_logical_experts,
             slot_bank=slot_bank,
             device=device,
+            allow_loading_slots=transfer_handle is not None,
         )
         if timeline_enabled:
             self._record_timeline_event(
@@ -615,6 +689,15 @@ class MoeOffloadRuntime:
                 payload={
                     "physical_expert_count": int(prepared_weights.physical_expert_count),
                 },
+            )
+        if self.config.async_load:
+            return PreparedSlotWeights(
+                w1=prepared_weights.w1,
+                w2=prepared_weights.w2,
+                log2phy=prepared_weights.log2phy,
+                physical_expert_count=prepared_weights.physical_expert_count,
+                mapping=prepared_weights.mapping,
+                transfer_handle=transfer_handle,
             )
         return prepared_weights
 
@@ -716,6 +799,15 @@ def _bundle_nbytes(bundle) -> int:
     if bundle.w2_scale is not None:
         total += _tensor_nbytes(bundle.w2_scale)
     return int(total)
+
+
+def _slot_ready(slot_bank: ExpertSlotBank, key: ExpertKey) -> bool:
+    slot = slot_bank.lookup(key)
+    return slot is not None and slot.state == SlotState.READY
+
+
+def _chunks(values: tuple[int, ...], size: int) -> list[tuple[int, ...]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
 
 
 _runtime: MoeOffloadRuntime | None = None

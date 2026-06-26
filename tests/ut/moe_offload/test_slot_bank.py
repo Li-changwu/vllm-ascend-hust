@@ -72,3 +72,38 @@ def test_slot_bank_reports_backing_tensor_bytes():
     expected_bytes = bank.w13_slots.numel() * bank.w13_slots.element_size()
     expected_bytes += bank.w2_slots.numel() * bank.w2_slots.element_size()
     assert bank.total_bytes == expected_bytes
+
+
+def test_slot_bank_allocates_miss_batch_into_contiguous_slots():
+    bank = ExpertSlotBank(4, (2, 4), (4, 2), dtype=torch.float32, device=torch.device("cpu"))
+
+    slots = bank.allocate_contiguous_for(
+        (ExpertKey(0, 2), ExpertKey(0, 4), ExpertKey(0, 6)),
+        step_id=3,
+        max_batch_size=8,
+    )
+
+    assert [slot.slot_id for slot in slots] == [0, 1, 2]
+    assert [slot.state for slot in slots] == [SlotState.LOADING] * 3
+    assert [slot.expert_key for slot in slots] == [
+        ExpertKey(0, 2),
+        ExpertKey(0, 4),
+        ExpertKey(0, 6),
+    ]
+
+
+def test_slot_bank_batch_allocation_prefers_contiguous_lru_window():
+    bank = ExpertSlotBank(4, (2, 4), (4, 2), dtype=torch.float32, device=torch.device("cpu"))
+    for expert_id in range(4):
+        slot = bank.allocate_for(ExpertKey(0, expert_id), step_id=expert_id)
+        bank.mark_ready(slot.slot_id)
+
+    slots = bank.allocate_contiguous_for(
+        (ExpertKey(0, 10), ExpertKey(0, 11)),
+        step_id=9,
+        max_batch_size=8,
+    )
+
+    assert [slot.slot_id for slot in slots] == [0, 1]
+    assert bank.lookup(ExpertKey(0, 0)) is None
+    assert bank.lookup(ExpertKey(0, 1)) is None

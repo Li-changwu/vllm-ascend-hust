@@ -65,6 +65,7 @@ class MoEOffloadParams:
     num_logical_experts: int = -1
     expected_device_type: str = "npu"
     step_id: int = -1
+    transfer_handle: object | None = None
 
 
 @dataclass(frozen=True, slots=True)

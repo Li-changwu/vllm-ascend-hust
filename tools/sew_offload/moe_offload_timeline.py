@@ -35,9 +35,11 @@ PIPELINE_DETAIL_STAGE_LABELS = {
 OFFLOAD_STAGE_LABELS = {
     "active_expert_normalize": "active expert set",
     "slot_cache_lookup": "slot cache lookup",
+    "slot_batch_allocate": "slot batch allocate",
     "slot_allocate": "slot allocate/evict",
     "host_bundle_lookup": "host bundle lookup",
     "expert_h2d_load_sync": "expert H2D load",
+    "expert_h2d_batch_load_sync": "expert H2D batch load",
     "slot_mapping_build": "logical->physical map",
     "prepared_slot_weights": "slot weight view",
     "prepare_fixed_slot_plan": "fixed slot prepare",
@@ -588,7 +590,7 @@ def render_decode_layer_svg(
         ("stage_r_ms", "R token dispatch", "pipeline"),
         ("stage_c_ms", "C expert MLP", "pipeline"),
         ("stage_m_ms", "M token combine", "pipeline"),
-        ("expert_h2d_load_sync", "H2D load detail", "offload_detail"),
+        ("expert_h2d_batch_load_sync", "H2D batch load detail", "offload_detail"),
         ("slot_mapping_build", "slot map detail", "offload_detail"),
         ("slot_cache_lookup", "cache lookup detail", "offload_detail"),
         ("t_residual_wait", "T residual/wait", "pipeline_detail"),
@@ -639,6 +641,10 @@ def _summarize_timeline(records: list[dict[str, Any]]) -> dict[str, Any]:
     cache_hits = 0
     cache_misses = 0
     h2d_bytes = 0
+    has_batch_h2d = any(
+        str(record.get("name") or "") == "expert_h2d_batch_load_sync"
+        for record in records
+    )
     for record in records:
         name = str(record.get("name") or "unknown")
         by_name[name].append(_timeline_duration_ms(record))
@@ -648,7 +654,9 @@ def _summarize_timeline(records: list[dict[str, Any]]) -> dict[str, Any]:
                 cache_hits += 1
             else:
                 cache_misses += 1
-        if name == "expert_h2d_load_sync":
+        if name == "expert_h2d_batch_load_sync" or (
+            name == "expert_h2d_load_sync" and not has_batch_h2d
+        ):
             h2d_bytes += _int(payload.get("bytes"))
 
     rows = []
@@ -959,7 +967,9 @@ def _tiny_stage_label(key: str) -> str:
         "stage_r_ms": "R",
         "stage_c_ms": "C",
         "stage_m_ms": "M",
+        "expert_h2d_batch_load_sync": "H2D8",
         "expert_h2d_load_sync": "H2D",
+        "slot_batch_allocate": "alloc8",
         "slot_mapping_build": "map",
         "slot_cache_lookup": "cache",
         "slot_allocate": "alloc",
@@ -1010,9 +1020,11 @@ def _stage_color(key: str, source: str) -> str:
     offload_colors = {
         "active_expert_normalize": "#72b7b2",
         "slot_cache_lookup": "#e45756",
+        "slot_batch_allocate": "#c44e52",
         "slot_allocate": "#ff9da6",
         "host_bundle_lookup": "#9d755d",
         "expert_h2d_load_sync": "#4c78a8",
+        "expert_h2d_batch_load_sync": "#2f4b7c",
         "slot_mapping_build": "#59a14f",
         "prepared_slot_weights": "#b07aa1",
         "prepare_fixed_slot_plan": "#2f4b7c",
@@ -1063,6 +1075,8 @@ def _timeline_suffix(name: str, payload: dict[str, Any]) -> str:
         return f" e{payload.get('expert_id', '?')} {hit}"
     if name in {"slot_allocate", "host_bundle_lookup", "expert_h2d_load_sync"}:
         return f" e{payload.get('expert_id', '?')}"
+    if name in {"slot_batch_allocate", "expert_h2d_batch_load_sync"}:
+        return f" n{payload.get('batch_size', '?')}"
     return ""
 
 

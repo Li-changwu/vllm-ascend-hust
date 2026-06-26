@@ -152,6 +152,7 @@ def build_fused_experts_input(
     offload_expected_device_type: str = "npu",
     offload_step_id: int = -1,
     offload_profile_only: bool = False,
+    offload_transfer_handle: object | None = None,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -188,6 +189,7 @@ def build_fused_experts_input(
             num_logical_experts=offload_num_logical_experts,
             expected_device_type=offload_expected_device_type,
             step_id=offload_step_id,
+            transfer_handle=offload_transfer_handle,
         )
         if offload_enabled or offload_profile_only
         else None,

@@ -218,6 +218,8 @@ class MoECommMethod(ABC):
         if do_pipe_profile:
             e2 = pipeline_profiler.record()  # after Stage R, before Stage C
 
+        _wait_for_moe_offload_transfer(fused_experts_input.offload)
+
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
             token_dispatch_output=token_dispatch_output,
@@ -441,6 +443,7 @@ class MoECommMethod(ABC):
                 num_logical_experts=offload.num_logical_experts,
                 expected_device_type=offload.expected_device_type,
                 step_id=step_id,
+                transfer_handle=prepared_weights.transfer_handle,
             ),
         )
 
@@ -460,6 +463,17 @@ def _next_offload_step_id(runtime, fallback_step_id: int = -1) -> int:
     if callable(next_step_id):
         return int(next_step_id(runtime))
     return 0
+
+
+def _wait_for_moe_offload_transfer(offload: MoEOffloadParams | None) -> None:
+    if offload is None:
+        return
+    handle = getattr(offload, "transfer_handle", None)
+    if handle is None:
+        return
+    wait = getattr(handle, "wait", None)
+    if callable(wait):
+        wait()
 
 
 class AllGatherCommImpl(MoECommMethod):

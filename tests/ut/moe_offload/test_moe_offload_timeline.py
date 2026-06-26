@@ -27,13 +27,23 @@ def test_moe_offload_timeline_summarizes_and_renders_views(tmp_path):
         },
         {
             "event": "moe_offload_timeline",
-            "name": "expert_h2d_load_sync",
+            "name": "expert_h2d_batch_load_sync",
             "layer_id": 1,
             "step_id": 7,
             "start_ns": 3_000,
             "end_ns": 103_000,
             "duration_us": 100.0,
-            "payload": {"expert_id": 2, "slot_id": 0, "bytes": 4096},
+            "payload": {"expert_ids": [2], "slot_ids": [0], "bytes": 4096, "batch_size": 1},
+        },
+        {
+            "event": "moe_offload_timeline",
+            "name": "expert_h2d_load_sync",
+            "layer_id": 1,
+            "step_id": 7,
+            "start_ns": 3_000,
+            "end_ns": 3_000,
+            "duration_us": 0.0,
+            "payload": {"expert_id": 2, "slot_id": 0, "bytes": 4096, "batched": True},
         },
         {
             "event": "moe_offload_timeline",
@@ -77,11 +87,11 @@ def test_moe_offload_timeline_summarizes_and_renders_views(tmp_path):
     assert summary["offload_timeline"]["cache"]["misses"] == 1
     assert summary["offload_timeline"]["h2d_bytes"] == 4096
     assert "```mermaid" in markdown
-    assert "expert H2D load e2" in markdown
+    assert "expert H2D batch load n1" in markdown
     assert "<svg" in svg
     assert "SEW-MoE Offload Timing Overview" in svg
-    assert "expert H2D load" in svg
-    assert any(event.get("name") == "expert_h2d_load_sync" for event in chrome_trace["traceEvents"])
+    assert "expert H2D batch load" in svg
+    assert any(event.get("name") == "expert_h2d_batch_load_sync" for event in chrome_trace["traceEvents"])
     assert any(event.get("name") == "C expert MLP" for event in chrome_trace["traceEvents"])
     assert any(event.get("name") == "R init routing op" for event in chrome_trace["traceEvents"])
 
@@ -123,11 +133,11 @@ def test_moe_offload_timeline_renders_decode_layer_svg():
             },
             {
                 "event": "moe_offload_timeline",
-                "name": "expert_h2d_load_sync",
+                "name": "expert_h2d_batch_load_sync",
                 "layer_id": 0,
                 "step_id": 2,
                 "duration_us": 100.0,
-                "payload": {"bytes": 4096},
+                "payload": {"bytes": 4096, "batch_size": 1},
             },
             {
                 "event": "moe_offload_timeline",
@@ -161,6 +171,6 @@ def test_moe_offload_timeline_renders_decode_layer_svg():
     assert "L00" in svg
     assert "L01" in svg
     assert "slot" in svg
-    assert "H2D load detail" in svg
+    assert "H2D batch load detail" in svg
     assert "R init routing" in svg
     assert "R residual/wait" in svg

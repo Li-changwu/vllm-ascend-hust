@@ -334,6 +334,10 @@ def _summarize_offload_timeline_events(records: list[dict[str, Any]]) -> dict[st
     cache_hits = 0
     cache_misses = 0
     h2d_bytes = 0
+    has_batch_h2d = any(
+        str(record.get("name") or "") == "expert_h2d_batch_load_sync"
+        for record in timeline_records
+    )
     for record in timeline_records:
         name = str(record.get("name") or "unknown")
         duration_us = _float(record.get("duration_us"))
@@ -346,7 +350,9 @@ def _summarize_offload_timeline_events(records: list[dict[str, Any]]) -> dict[st
                 cache_hits += 1
             else:
                 cache_misses += 1
-        if name == "expert_h2d_load_sync":
+        if name == "expert_h2d_batch_load_sync" or (
+            name == "expert_h2d_load_sync" and not has_batch_h2d
+        ):
             h2d_bytes += _int(payload.get("bytes"))
 
     stage_rows = []

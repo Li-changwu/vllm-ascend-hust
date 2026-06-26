@@ -23,6 +23,7 @@ from vllm_ascend.moe_offload.expert_key import ExpertKey
 from vllm_ascend.moe_offload.host_store import ExpertWeightBundle
 from vllm_ascend.moe_offload.layout import LayoutValidator
 from vllm_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
+from vllm_ascend.moe_offload.transfer_engine import ExpertTransferHandle
 
 
 def _dedupe_preserve_order(values: tuple[int, ...]) -> tuple[int, ...]:
@@ -54,6 +55,7 @@ class ExpertSlotMapping:
         slot_bank: ExpertSlotBank,
         device: torch.device,
         dtype: torch.dtype = torch.int32,
+        allow_loading_slots: bool = False,
     ) -> "ExpertSlotMapping":
         if num_logical_experts <= 0:
             raise ValueError("num_logical_experts must be greater than 0")
@@ -76,7 +78,10 @@ class ExpertSlotMapping:
             slot = slot_bank.lookup(ExpertKey(layer_id, expert_id))
             if slot is None:
                 raise RuntimeError(f"active expert {expert_id} is not resident in layer {layer_id}")
-            if slot.state != SlotState.READY:
+            allowed_states = {SlotState.READY}
+            if allow_loading_slots:
+                allowed_states.add(SlotState.LOADING)
+            if slot.state not in allowed_states:
                 raise RuntimeError(f"active expert {expert_id} slot {slot.slot_id} is not ready")
 
             logical_to_physical[expert_id] = int(slot.slot_id)
@@ -108,6 +113,11 @@ class PreparedSlotWeights:
     log2phy: torch.Tensor
     physical_expert_count: int
     mapping: ExpertSlotMapping
+    transfer_handle: ExpertTransferHandle | None = None
+
+    def wait_for_transfers(self) -> None:
+        if self.transfer_handle is not None:
+            self.transfer_handle.wait()
 
     def validate_backend_ready(self, *, expected_device_type: str) -> None:
         if self.physical_expert_count <= 0:
