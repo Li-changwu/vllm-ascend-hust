@@ -56,6 +56,23 @@ class MoEWeights:
 
 
 @dataclass(frozen=True, slots=True)
+class MoEOffloadParams:
+    """Optional SEW-Offload metadata consumed at the fused_experts boundary.
+
+    When the vllm-moe-offload-ascend plugin is not installed, all fields
+    retain their defaults (offload disabled). The plugin monkey-patches
+    ``get_moe_offload_runtime`` to supply real per-layer offload parameters.
+    """
+
+    enabled: bool = False
+    profile_only: bool = False
+    layer_id: int = -1
+    num_logical_experts: int = -1
+    expected_device_type: str = "npu"
+    step_id: int = -1
+
+
+@dataclass(frozen=True, slots=True)
 class MoEFusedExpertsInput:
     """Top-level input for the routed experts pipeline."""
 
@@ -68,6 +85,7 @@ class MoEFusedExpertsInput:
     activation: str = "silu"
     need_trans: bool = False
     dynamic_eplb: bool = False
+    offload: MoEOffloadParams | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +162,7 @@ class MoEMlpComputeInput:
 __all__ = [
     "MoEPrepareOutput",
     "MoEWeights",
+    "MoEOffloadParams",
     "MoEFusedExpertsInput",
     "MoETokenDispatchInput",
     "MoEMC2CombineMetadata",

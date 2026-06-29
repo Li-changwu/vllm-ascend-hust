@@ -30,6 +30,7 @@ from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp4_linear_available,
     ensure_mxfp4_moe_available,
 )
+import vllm_ascend.ops  # noqa: F401  # ensure ops is initialized before submodule access
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 

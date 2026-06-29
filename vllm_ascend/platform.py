@@ -263,6 +263,9 @@ class NPUPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        # Ensure ops is imported before quantization (which depends on
+        # ops.fused_moe.moe_runtime_args at import time).
+        import vllm_ascend.ops  # noqa: F401
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
         if vllm_config.model_config is not None:
