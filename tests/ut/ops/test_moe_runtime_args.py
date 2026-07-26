@@ -50,6 +50,7 @@ class TestMoERuntimeArgs(unittest.TestCase):
             "MoEFusedExpertsInput",
             "MoEMC2CombineMetadata",
             "MoEMlpComputeInput",
+            "MoEOffloadParams",
             "MoEPrepareOutput",
             "MoEQuantParams",
             "MoERoutingParams",
@@ -107,6 +108,35 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertEqual(fused_experts_input.routing.global_redundant_expert_num, 2)
                 self.assertEqual(fused_experts_input.activation, "gelu")
                 self.assertEqual(fused_experts_input.quant.quant_type, quant_type)
+                self.assertIsNone(fused_experts_input.offload)
+
+    def test_build_fused_experts_input_preserves_offload_metadata(self):
+        fused_experts_input = build_fused_experts_input(
+            hidden_states=torch.randn(2, 8),
+            topk_weights=torch.randn(2, 2),
+            topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
+            w1=torch.randn(2, 8, 16),
+            w2=torch.randn(2, 16, 8),
+            quant_type=QuantType.NONE,
+            dynamic_eplb=False,
+            physical_expert_count=2,
+            swiglu_limit=7.0,
+            offload_enabled=True,
+            offload_layer_id=6,
+            offload_num_logical_experts=8,
+            offload_expected_device_type="cpu",
+            offload_step_id=11,
+        )
+
+        self.assertEqual(fused_experts_input.routing.physical_expert_count, 2)
+        self.assertEqual(fused_experts_input.swiglu_limit, 7.0)
+        self.assertIsNotNone(fused_experts_input.offload)
+        assert fused_experts_input.offload is not None
+        self.assertTrue(fused_experts_input.offload.enabled)
+        self.assertEqual(fused_experts_input.offload.layer_id, 6)
+        self.assertEqual(fused_experts_input.offload.num_logical_experts, 8)
+        self.assertEqual(fused_experts_input.offload.expected_device_type, "cpu")
+        self.assertEqual(fused_experts_input.offload.step_id, 11)
 
     def test_build_fused_experts_input_merges_dense_and_quant_weights(self):
         w1 = torch.randn(2, 8, 16)

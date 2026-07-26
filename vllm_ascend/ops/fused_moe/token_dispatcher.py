@@ -41,6 +41,11 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     TMoECombineMetadata,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+
+try:
+    from vllm_ascend.moe_offload.pipeline import get_moe_pipeline_profiler  # noqa: F401
+except ImportError:
+    from vllm_ascend._moe_offload_null import get_moe_pipeline_profiler  # noqa: F401
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_device_type,
@@ -399,6 +404,14 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
+        if token_dispatch_input.routing.physical_expert_count is not None:
+            if expert_map is not None:
+                raise RuntimeError("physical_expert_count is only supported without expert_map")
+            if global_redundant_expert_num != 0:
+                raise RuntimeError("physical_expert_count is only supported without redundant experts")
+            global_num_experts = int(token_dispatch_input.routing.physical_expert_count)
+            first_expert_idx = 0
+            last_expert_idx = global_num_experts
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,

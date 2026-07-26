@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
@@ -44,6 +44,16 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+
+try:
+    from vllm_ascend.moe_offload.pipeline import get_moe_pipeline_profiler  # noqa: F401
+    from vllm_ascend.moe_offload.runtime import MoeOffloadDecisionPath, get_moe_offload_runtime
+except ImportError:
+    from vllm_ascend._moe_offload_null import (
+        MoeOffloadDecisionPath,
+        get_moe_offload_runtime,
+        get_moe_pipeline_profiler,  # noqa: F401
+    )
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
@@ -136,6 +146,7 @@ class MoECommMethod(ABC):
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
+        fused_experts_input = self._maybe_apply_moe_offload_plan(fused_experts_input)
         routed_topk_ids = fused_experts_input.topk_ids
         if fused_experts_input.routing.log2phy is not None:
             routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
@@ -173,6 +184,57 @@ class MoECommMethod(ABC):
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
 
+    def _maybe_apply_moe_offload_plan(self, fused_experts_input: MoEFusedExpertsInput) -> MoEFusedExpertsInput:
+        offload = fused_experts_input.offload
+        if offload is None or not offload.enabled:
+            return fused_experts_input
+
+        runtime = get_moe_offload_runtime()
+        # Slot selection is a host-side control-plane decision. Synchronize the
+        # routing ids only on the explicitly enabled offload path.
+        active_experts = tuple(
+            int(expert_id) for expert_id in torch.unique(fused_experts_input.topk_ids.detach().cpu()).tolist()
+        )
+        step_id = _next_offload_step_id(runtime, offload.step_id)
+        use_slot_cache_path = True
+        if runtime.should_use_layered_runtime:
+            decision = runtime.decide_layered_path(
+                layer_id=offload.layer_id,
+                active_experts=active_experts,
+                step_id=step_id,
+            )
+            if decision.path is MoeOffloadDecisionPath.FAIL_CLOSED:
+                raise RuntimeError(
+                    f"MoE offload layered runtime failed closed: layer_id={offload.layer_id}, reason={decision.reason}"
+                )
+            use_slot_cache_path = decision.path is MoeOffloadDecisionPath.SLOT_CACHE_PATH
+
+        if not use_slot_cache_path:
+            return fused_experts_input
+
+        prepared_weights = runtime.prepare_fixed_slot_plan(
+            layer_id=offload.layer_id,
+            step_id=step_id,
+            active_experts=active_experts,
+            num_logical_experts=offload.num_logical_experts,
+            device=fused_experts_input.topk_ids.device,
+        )
+        prepared_weights.validate_backend_ready(expected_device_type=offload.expected_device_type)
+        return replace(
+            fused_experts_input,
+            weights=replace(
+                fused_experts_input.weights,
+                w1=prepared_weights.w1,
+                w2=prepared_weights.w2,
+            ),
+            routing=replace(
+                fused_experts_input.routing,
+                log2phy=prepared_weights.log2phy,
+                physical_expert_count=prepared_weights.physical_expert_count,
+            ),
+            offload=replace(offload, step_id=step_id),
+        )
+
     @abstractmethod
     def _get_token_dispatcher(self) -> MoETokenDispatcher:
         raise NotImplementedError("_get_token_dispatcher function not implemented.")
@@ -180,6 +242,15 @@ class MoECommMethod(ABC):
     @abstractmethod
     def _get_prepare_finalize(self) -> PrepareAndFinalize:
         raise NotImplementedError("_get_prepare_finalize function not implemented.")
+
+
+def _next_offload_step_id(runtime, fallback_step_id: int = -1) -> int:
+    if int(fallback_step_id) >= 0:
+        return int(fallback_step_id)
+    next_step_id = getattr(type(runtime), "next_step_id", None)
+    if callable(next_step_id):
+        return int(next_step_id(runtime))
+    return 0
 
 
 class AllGatherCommImpl(MoECommMethod):

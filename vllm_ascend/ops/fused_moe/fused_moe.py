@@ -52,6 +52,11 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 
+try:
+    from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
+except ImportError:
+    from vllm_ascend._moe_offload_null import get_moe_offload_runtime
+
 if vllm_version_is("0.23.0"):
     from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 else:
@@ -94,6 +99,45 @@ def mock_true():
     return True
 
 
+def _fixed_slot_device_for_processed_weight(weight: torch.Tensor) -> torch.device:
+    if weight.device.type == "cpu":
+        return torch.device("npu", torch.npu.current_device())
+    return weight.device
+
+
+def _empty_npu_cache_if_available() -> None:
+    if hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+        torch.npu.empty_cache()
+
+
+def _should_stage_processed_expert_weights_to_cpu(layer) -> bool:
+    layer_id = int(getattr(layer, "layer_id", -1))
+    if layer_id < 0:
+        return False
+    return get_moe_offload_runtime().should_use_fixed_slot_plan_for_layer(layer_id)
+
+
+def _stage_processed_weight_to_cpu_if_needed(weight: torch.Tensor, *, enabled: bool) -> torch.Tensor:
+    if enabled and weight.device.type != "cpu":
+        weight = weight.to("cpu")
+        _empty_npu_cache_if_available()
+    return weight
+
+
+def _build_fixed_slot_profile_topk_ids(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_slots: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if top_k > num_slots:
+        raise RuntimeError(f"fixed-slot profile run requires num_slots >= top_k, got {num_slots} < {top_k}")
+    base_ids = torch.arange(top_k, device=device, dtype=dtype)
+    return base_ids.unsqueeze(0).expand(num_tokens, top_k).contiguous()
+
+
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
         super().__init__(moe=moe)
@@ -111,6 +155,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
+        stage_processed_weights_to_cpu = _should_stage_processed_expert_weights_to_cpu(layer)
 
         w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
         layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
@@ -130,6 +175,26 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         else:
             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
             layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+
+        if stage_processed_weights_to_cpu:
+            layer.w13_weight = torch.nn.Parameter(
+                _stage_processed_weight_to_cpu_if_needed(layer.w13_weight.data, enabled=True),
+                requires_grad=False,
+            )
+            layer.w2_weight = torch.nn.Parameter(
+                _stage_processed_weight_to_cpu_if_needed(layer.w2_weight.data, enabled=True),
+                requires_grad=False,
+            )
+
+        runtime = get_moe_offload_runtime()
+        layer_id = int(getattr(layer, "layer_id", -1))
+        if runtime.should_use_fixed_slot_plan_for_layer(layer_id):
+            runtime.register_layer_for_fixed_slots(
+                layer,
+                slot_device=_fixed_slot_device_for_processed_weight(layer.w13_weight),
+            )
+            if runtime.config.release_original_expert_weights:
+                runtime.release_original_expert_weights_if_ready(layer)
 
     def apply(
         self,
@@ -183,6 +248,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
+        moe_offload_runtime = get_moe_offload_runtime()
+        moe_step_id = -1
+        if moe_offload_runtime.config.enabled:
+            moe_step_id = moe_offload_runtime.next_step_id()
+            topk_ids, topk_weights = moe_offload_runtime.trace_routing(
+                layer_id=getattr(layer, "layer_id", -1),
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                num_experts=num_logical_experts,
+                step_id=moe_step_id,
+            )
         if not vllm_version_is("0.23.0"):
             try:
                 _vllm_config = get_current_vllm_config()
@@ -197,6 +273,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 if capturer is not None:
                     capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
 
+        if moe_offload_runtime.should_use_fixed_slots and zero_expert_num > 0 and zero_expert_type is not None:
+            raise NotImplementedError("MoE offload fixed slots do not support zero expert path yet")
+
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
@@ -210,7 +289,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        if enable_force_load_balance:
+        if enable_force_load_balance and moe_offload_runtime.should_use_fixed_slots:
+            topk_ids = _build_fixed_slot_profile_topk_ids(
+                num_tokens=topk_ids.size(0),
+                top_k=topk_ids.size(1),
+                num_slots=moe_offload_runtime.config.num_slots,
+                device=topk_ids.device,
+                dtype=topk_ids.dtype,
+            )
+        elif enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
@@ -240,6 +327,26 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w1_scale_bias = None
             w2_scale_bias = None
 
+        offload_enabled = False
+        layer_id = int(getattr(layer, "layer_id", -1))
+        if moe_offload_runtime.should_use_fixed_slot_plan_for_layer(layer_id):
+            if _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER:
+                raise NotImplementedError("MoE offload fixed slots currently support AllGather only")
+            if expert_map is not None:
+                raise NotImplementedError("MoE offload fixed slots do not support expert_map yet")
+            if global_redundant_expert_num != 0:
+                raise NotImplementedError("MoE offload fixed slots do not support redundant experts yet")
+            if self.moe.has_bias:
+                raise NotImplementedError("MoE offload fixed slots do not support expert bias yet")
+            if not moe_offload_runtime.is_layer_registered(layer_id):
+                moe_offload_runtime.register_layer_for_fixed_slots(
+                    layer,
+                    slot_device=_fixed_slot_device_for_processed_weight(layer.w13_weight),
+                )
+                if moe_offload_runtime.config.release_original_expert_weights:
+                    moe_offload_runtime.release_original_expert_weights_if_ready(layer)
+            offload_enabled = True
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -263,6 +370,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                offload_enabled=offload_enabled,
+                offload_layer_id=layer_id,
+                offload_num_logical_experts=num_logical_experts,
+                offload_expected_device_type=x.device.type,
+                offload_step_id=moe_step_id,
+                offload_profile_only=bool(moe_offload_runtime.config.trace_only),
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
